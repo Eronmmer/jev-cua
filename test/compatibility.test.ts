@@ -1,0 +1,107 @@
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+
+import {
+  assessCuaCompatibility,
+  PINNED_CUA_DRIVER_VERSION,
+  verifyCuaDriverProvenance,
+} from "../src/cua/compatibility.js";
+import type { DriverToolDescriptor } from "../src/types.js";
+
+const required = [
+  "health_report",
+  "check_permissions",
+  "browser_prepare",
+  "browser_navigate",
+  "get_browser_state",
+  "list_windows",
+  "end_session",
+];
+
+function actionTool(name: string): DriverToolDescriptor {
+  return {
+    name,
+    outputSchema: {
+      type: "object",
+      anyOf: [
+        {
+          type: "object",
+          required: ["effect", "route"],
+          properties: {
+            effect: {
+              enum: [
+                "confirmed",
+                "partial",
+                "unverifiable",
+                "suspected_noop",
+                "refused",
+              ],
+            },
+            route: {
+              enum: [
+                "accessibility",
+                "synthetic_events",
+                "global_input",
+                "system_api",
+                "dom",
+                "trusted_input",
+              ],
+            },
+          },
+        },
+      ],
+    },
+  };
+}
+
+function reviewedTools(): DriverToolDescriptor[] {
+  return [
+    ...required.map((name) => ({ name })),
+    actionTool("browser_click"),
+    actionTool("browser_type"),
+    actionTool("browser_pointer"),
+  ];
+}
+
+describe("Cua runtime trust contract", () => {
+  test("accepts only the pinned version and exact reviewed action receipt enums", () => {
+    assert.equal(
+      assessCuaCompatibility(PINNED_CUA_DRIVER_VERSION, reviewedTools())
+        .compatible,
+      true,
+    );
+
+    const changedVersion = assessCuaCompatibility(
+      "cua-driver 0.28.3",
+      reviewedTools(),
+    );
+    assert.equal(changedVersion.compatible, false);
+    assert.equal(changedVersion.versionMatches, false);
+
+    const changedSchema = reviewedTools();
+    const click = changedSchema.find((tool) => tool.name === "browser_click")!;
+    const branch = click.outputSchema!.anyOf as Array<Record<string, unknown>>;
+    const properties = branch[0]!.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+    properties.effect!.enum = ["confirmed"];
+    const assessment = assessCuaCompatibility(
+      PINNED_CUA_DRIVER_VERSION,
+      changedSchema,
+    );
+    assert.equal(assessment.compatible, false);
+    assert.equal(assessment.receiptSchemasMatch, false);
+  });
+
+  test(
+    "accepts the installed signed Cua application identity on macOS",
+    { skip: process.platform !== "darwin" },
+    async () => {
+      const provenance = await verifyCuaDriverProvenance(
+        "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
+      );
+      assert.deepEqual(provenance, { trusted: true, reasons: [] });
+    },
+  );
+});

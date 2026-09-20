@@ -1,0 +1,28 @@
+{
+  "name": "jev-cua",
+  "version": "0.1.0",
+  "description": "Run bounded computer-use workflows through a local Cua Driver and TypeSafe Jev fast path.",
+  "author": {
+    "name": "Eronmonsele Aigbiluese",
+    "url": "https://github.com/Eronmmer"
+  },
+  "homepage": "https://github.com/Eronmmer/jev-cua",
+  "repository": "https://github.com/Eronmmer/jev-cua",
+  "keywords": ["computer-use", "cua", "jev", "typesafe", "mcp"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Jev Cua Fastpath",
+    "shortDescription": "Fast, verified bounded computer-use workflows.",
+    "longDescription": "Runs structured UI subgoals in a local observe-decide-act-verify loop. Cua Driver owns desktop interaction, Jev selects only allowlisted action IDs, and uncertain or consequential actions return to Codex or the user.",
+    "developerName": "Eronmonsele Aigbiluese",
+    "category": "Productivity",
+    "capabilities": ["Computer Use", "Interactive", "Write"],
+    "websiteURL": "https://github.com/Eronmmer/jev-cua",
+    "defaultPrompt": [
+      "Run this bounded browser workflow with Jev Cua.",
+      "Check whether Jev Cua is ready on this Mac.",
+      "Use the fast path and stop before consequential actions."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

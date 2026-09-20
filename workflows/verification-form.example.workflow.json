@@ -1,0 +1,73 @@
+{
+  "schema": "jev-cua.workflow.v1",
+  "id": "verification-form-example",
+  "version": 1,
+  "enabled": false,
+  "description": "Disabled reference workflow for the Cua Jev verification fixture.",
+  "goal": "Enter the approved verification value and advance to the fixture's completed state.",
+  "target": {
+    "kind": "isolated",
+    "start_url": "https://fixture.invalid/",
+    "navigation_effect": "read_only_landing"
+  },
+  "allowed_origins": ["https://fixture.invalid"],
+  "inputs": [
+    {
+      "id": "verification_value",
+      "description": "Approved fixture verification value",
+      "target_hints": ["verification value"],
+      "classification": "private",
+      "max_length": 64,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "allowed_disclosure_origins": ["https://fixture.invalid"]
+    }
+  ],
+  "success": {
+    "kind": "exact_url",
+    "origin": "https://fixture.invalid",
+    "pathname": "/complete"
+  },
+  "steps": [
+    {
+      "id": "enter_verification_value",
+      "description": "Replace the exact verification-value field with the approved local input.",
+      "page": { "origin": "https://fixture.invalid", "pathname": "/" },
+      "requires": [],
+      "action": {
+        "kind": "type",
+        "field": { "role": "textbox", "name": "verification value" },
+        "input_id": "verification_value",
+        "effect": "private_data_entry"
+      },
+      "ensures": {
+        "kind": "exact_field_equals",
+        "page": { "origin": "https://fixture.invalid", "pathname": "/" },
+        "field": { "role": "textbox", "name": "verification value" },
+        "input_id": "verification_value"
+      }
+    },
+    {
+      "id": "advance_fixture",
+      "description": "Click the exact Continue control after the verification value matches.",
+      "page": { "origin": "https://fixture.invalid", "pathname": "/" },
+      "requires": [
+        {
+          "kind": "field_equals",
+          "field": { "role": "textbox", "name": "verification value" },
+          "input_id": "verification_value"
+        }
+      ],
+      "action": {
+        "kind": "click",
+        "control": { "role": "button", "name": "Continue" },
+        "input_route": "dom_event",
+        "effect": "reversible_navigation"
+      },
+      "ensures": {
+        "kind": "exact_url",
+        "origin": "https://fixture.invalid",
+        "pathname": "/complete"
+      }
+    }
+  ]
+}

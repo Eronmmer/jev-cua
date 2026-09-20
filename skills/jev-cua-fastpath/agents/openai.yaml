@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jev Cua Fastpath"
+  short_description: "Run bounded UI workflows through Jev and Cua"
+  default_prompt: "Use $jev-cua-fastpath to run this bounded computer-use workflow quickly and safely."
