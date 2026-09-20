@@ -5,14 +5,19 @@
   "description": "Production local Cua + TypeSafe Jev fast-path runtime for Codex and Waku",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.21.0"
   },
   "scripts": {
+    "benchmark": "tsx src/benchmark/cli.ts",
     "build": "tsup --config tsup.config.ts",
-    "check": "npm run typecheck && npm test && npm run build && npm run format:check",
+    "check": "npm run typecheck && npm run fixture:check && npm test && npm run build && npm run format:check",
     "dev": "tsx src/server.ts",
+    "fixture:check": "npm run fixture:types && tsc -p benchmark-fixture/tsconfig.json --noEmit && wrangler deploy --config benchmark-fixture/wrangler.jsonc --dry-run --outdir .wrangler/fixture-dry-run",
+    "fixture:deploy": "wrangler deploy --config benchmark-fixture/wrangler.jsonc",
+    "fixture:types": "wrangler types --config benchmark-fixture/wrangler.jsonc benchmark-fixture/.wrangler/types/runtime.d.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "reconcile-live": "tsx src/recovery/cli.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "validate:plugin": "python3 /Users/erons/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .",
@@ -21,6 +26,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "@typesafe-ai/sdk": "0.6.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
     "zod": "4.6.5"
   },
   "devDependencies": {
@@ -28,6 +35,7 @@
     "prettier": "3.6.2",
     "tsup": "8.5.0",
     "tsx": "4.20.3",
-    "typescript": "5.9.2"
+    "typescript": "5.9.2",
+    "wrangler": "4.135.0"
   }
 }

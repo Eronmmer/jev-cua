@@ -139,4 +139,37 @@ describe("TypeSafe policy projection", () => {
       /pinned model/u,
     );
   });
+
+  test("rejects malformed provider token usage", async () => {
+    for (const usage of [
+      { input_tokens: -1, output_tokens: 1 },
+      { input_tokens: 1.5, output_tokens: 1 },
+      { input_tokens: 1, output_tokens: Number.NaN },
+      undefined,
+    ]) {
+      const fakeClient = {
+        systemOne: async () => ({
+          model: "jev-1.13.0",
+          answers: {
+            next_action: {
+              type: "choice",
+              choice: "c_one",
+              confidence: 0.98,
+              probabilities: { c_one: 0.96, c_two: 0.04 },
+            },
+            fits_c_one: { type: "noul", noul: 0.99 },
+          },
+          usage,
+        }),
+      };
+      const policy = new TypeSafeDecisionPolicy(
+        fakeClient as never,
+        loadRuntimeConfig({}),
+      );
+      await assert.rejects(
+        () => policy.choose({ ...fixture(), goal: "Continue" }),
+        /token count/u,
+      );
+    }
+  });
 });

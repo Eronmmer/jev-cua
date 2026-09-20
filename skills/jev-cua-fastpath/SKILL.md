@@ -12,7 +12,7 @@ Use this skill as a bounded execution engine beneath the main agent. It is not a
 1. Call `jev_cua_doctor`. Shadow validation can continue without a TypeSafe credential or macOS input permissions; live execution cannot.
 2. Call `jev_cua_list_workflows`. Match the user's task to exactly one enabled workflow. Record its `id`, `version`, `digest`, approval status, and required inputs.
 3. Do not improvise a workflow, edit a manifest, or substitute a similarly named control. Use ordinary computer use when there is no exact match.
-4. Call `jev_cua_run_workflow` in `shadow` mode with the exact workflow ID, version, digest, a new shadow-only idempotency key, and only the declared inputs. Shadow mode validates the manifest, constraints, trust pin, and static action/postcondition plan. It launches no browser, calls no TypeSafe service, and selects no live UI action.
+4. Call `jev_cua_run_workflow` in `shadow` mode with the exact workflow ID, version, digest, a new shadow-only idempotency key, and only the declared inputs. Shadow mode validates the manifest, constraints, and static action/postcondition plan; approval remains the separate status returned by `jev_cua_list_workflows`. It launches no browser, calls no TypeSafe service, and selects no live UI action.
 5. Inspect `shadow_plan`. Proceed to `live` only when the fixed actions, effects, and exact postconditions match the user's request, the user asked for execution, and the workflow remains approved at the same digest.
 6. Use a distinct new idempotency key for the live attempt. Thereafter, reuse that live key only to read that exact attempt. Never generate a new key to replay an action whose delivery is uncertain.
 7. Call `jev_cua_get_run` when a run is interrupted or its outcome is unclear.

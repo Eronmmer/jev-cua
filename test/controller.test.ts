@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../src/config.js";
 import { DriverToolError } from "../src/cua/client.js";
 import { FastpathController } from "../src/engine/controller.js";
 import { buildBrowserCandidates } from "../src/policy/candidates.js";
-import { DesktopLease, RunStore } from "../src/state.js";
+import { DesktopLease, LiveExecutionBarrier, RunStore } from "../src/state.js";
 import { buildCompiledWorkflowCandidates } from "../src/workflows/compiler.js";
 import {
   bindWorkflowInputs,
@@ -46,6 +46,8 @@ class FakeDriver implements DriverClient {
   connectCount = 0;
   closeCount = 0;
   throwAmbiguouslyOnAction = false;
+  throwOnCleanup = false;
+  throwOnObservationOnce = false;
   private observationIndex = 0;
 
   constructor(
@@ -88,6 +90,14 @@ class FakeDriver implements DriverClient {
       };
     }
     if (tool === "get_browser_state") {
+      if (this.throwOnObservationOnce) {
+        this.throwOnObservationOnce = false;
+        throw new DriverToolError(
+          tool,
+          false,
+          "simulated pre-action observation failure",
+        );
+      }
       const observation =
         this.observations[
           Math.min(this.observationIndex, this.observations.length - 1)
@@ -105,6 +115,9 @@ class FakeDriver implements DriverClient {
         );
       }
       return { status: "ok" };
+    }
+    if (tool === "end_session" && this.throwOnCleanup) {
+      throw new DriverToolError(tool, false, "simulated cleanup failure");
     }
     if (tool === "browser_navigate" || tool === "end_session")
       return { status: "ok" };
@@ -154,7 +167,11 @@ function executable(candidates: readonly Candidate[]): Candidate {
 
 function decisionFor(
   candidates: readonly Candidate[],
-  options: Readonly<{ confidence?: number; selectedProbability?: number }> = {},
+  options: Readonly<{
+    confidence?: number;
+    selectedProbability?: number;
+    model?: string;
+  }> = {},
 ): CandidateDecision {
   const selected = executable(candidates);
   const selectedProbability = options.selectedProbability ?? 0.97;
@@ -169,7 +186,7 @@ function decisionFor(
       ]),
     ),
     selectedFit: 0.99,
-    model: "jev-1.13.0",
+    model: options.model ?? "jev-1.13.0",
     inputTokens: 13,
     outputTokens: 5,
     latencyMs: 4,
@@ -268,17 +285,23 @@ function controller(
   driver: DriverClient,
   policy: DecisionPolicy,
   traces: TraceSink = new MemoryTraceSink(),
+  expectedDecisionModel = "jev-1.13.0",
 ): FastpathController {
+  const runs = new RunStore(directory);
   return new FastpathController({
     driver,
     policy,
     config: config(directory),
     lease: new DesktopLease(directory),
-    runs: new RunStore(directory),
+    runs,
+    safetyRuns: runs,
+    executionBarrier: new LiveExecutionBarrier(directory),
+    isolatedCleanupResolvesReconciliation: false,
     traces,
     candidateBuilder: buildBrowserCandidates,
     candidateSemanticPrefix: "click:",
     policyFingerprint: "a".repeat(64),
+    expectedDecisionModel,
   });
 }
 
@@ -410,12 +433,16 @@ function compiledController(
   const workflow = compiledWorkflowFixture();
   const invocation = bindWorkflowInputs(workflow, { reference: "ABC-123" });
   const semanticPrefix = `workflow:${workflow.id}:${workflow.version}:`;
+  const runs = new RunStore(directory);
   const subject = new FastpathController({
     driver,
     policy,
     config: config(directory),
     lease: new DesktopLease(directory),
-    runs: new RunStore(directory),
+    runs,
+    safetyRuns: runs,
+    executionBarrier: new LiveExecutionBarrier(directory),
+    isolatedCleanupResolvesReconciliation: false,
     traces: new MemoryTraceSink(),
     candidateBuilder: ({ observation, values, completedSemanticKeys }) =>
       buildCompiledWorkflowCandidates({
@@ -426,6 +453,7 @@ function compiledController(
       }),
     candidateSemanticPrefix: semanticPrefix,
     policyFingerprint: "b".repeat(64),
+    expectedDecisionModel: "jev-1.13.0",
   });
   const request: RunRequest = {
     runKey: "compiled-run-key",
@@ -461,6 +489,7 @@ test("shadow mode validates locally without launching a browser or calling the p
   const result = await subject.run(request);
 
   assert.equal(result.outcome, "shadow_complete");
+  assert.equal(result.cleanupSucceeded, null);
   assert.equal(result.steps.length, 0);
   assert.equal(policy.calls, 0);
   assert.deepEqual(driver.mutatingCalls(), []);
@@ -480,8 +509,35 @@ test("an initially satisfied terminal condition performs no Jev decision or sema
   const result = await subject.run(request);
 
   assert.equal(result.outcome, "verified");
+  assert.equal(result.cleanupSucceeded, true);
   assert.equal(policy.calls, 0);
   assert.equal(driver.mutatingCalls().length, 0);
+});
+
+test("a cleaned pre-action browser failure does not poison later live work", async (t) => {
+  const directory = await stateDirectory(t);
+  const driver = new FakeDriver([
+    observation(false),
+    observation(false),
+    observation(true),
+  ]);
+  driver.throwOnObservationOnce = true;
+  const policy = new FunctionPolicy(({ candidates }) =>
+    Promise.resolve(decisionFor(candidates)),
+  );
+  const subject = controller(directory, driver, policy);
+
+  const failed = await subject.run(isolatedRequest("pre-action-failure"));
+  assert.equal(failed.outcome, "unknown");
+  assert.equal(failed.reconciliationRequired, false);
+  assert.equal(failed.cleanupSucceeded, true);
+  assert.deepEqual(await new LiveExecutionBarrier(directory).status(), {
+    blocked: false,
+  });
+
+  const recovered = await subject.run(isolatedRequest("post-failure-run"));
+  assert.equal(recovered.outcome, "verified");
+  assert.equal(driver.mutatingCalls().length, 1);
 });
 
 test("an already satisfied first step is reconciled and only the second step is dispatched", async (t) => {
@@ -548,6 +604,7 @@ test("an accepted dispatch with an unchanged page never unlocks the next workflo
   assert.equal(result.outcome, "unknown");
   assert.equal(result.reconciliationRequired, true);
   assert.equal(result.frontierFallbackRecommended, false);
+  assert.ok((result.steps[0]?.verificationMs ?? 0) > 0);
   assert.deepEqual(
     driver.mutatingCalls().map((call) => call.tool),
     ["browser_type"],
@@ -601,7 +658,7 @@ test("live mode executes one bounded action and verifies its postcondition", asy
   assert.equal(driver.mutatingCalls()[0]?.arguments.tab_id, "tab-1");
   assert.match(
     String(driver.mutatingCalls()[0]?.arguments.session),
-    /^jev-cua-/,
+    /^jev-cua-[a-f0-9]{12}$/u,
   );
   assert.equal(
     driver.calls.filter((call) => call.tool === "get_browser_state").length,
@@ -611,6 +668,9 @@ test("live mode executes one bounded action and verifies its postcondition", asy
     driver.calls.filter((call) => call.tool === "end_session").length,
     1,
   );
+  assert.deepEqual(await new LiveExecutionBarrier(directory).status(), {
+    blocked: false,
+  });
   assert.deepEqual(
     traces.events
       .map((event) => event.event)
@@ -622,6 +682,7 @@ test("live mode executes one bounded action and verifies its postcondition", asy
       "action_started",
       "action_returned",
       "postcondition_checked",
+      "session_cleanup_succeeded",
     ],
   );
   const postcondition = traces.events.find(
@@ -629,6 +690,76 @@ test("live mode executes one bounded action and verifies its postcondition", asy
   );
   assert.equal(postcondition?.step_satisfied, true);
   assert.equal(postcondition?.workflow_satisfied, true);
+});
+
+test("session cleanup failure fails closed without replaying a verified action", async (t) => {
+  const directory = await stateDirectory(t);
+  const driver = new FakeDriver([
+    observation(false),
+    observation(false),
+    observation(true),
+  ]);
+  driver.throwOnCleanup = true;
+  const traces = new MemoryTraceSink();
+  const subject = controller(
+    directory,
+    driver,
+    new FunctionPolicy(({ candidates }) =>
+      Promise.resolve(decisionFor(candidates)),
+    ),
+    traces,
+  );
+
+  const result = await subject.run(isolatedRequest("cleanup-failure-run"));
+
+  assert.equal(result.outcome, "unknown");
+  assert.equal(result.reconciliationRequired, true);
+  assert.equal(result.safeToRetry, false);
+  assert.equal(result.cleanupSucceeded, false);
+  assert.match(result.reason, /session cleanup could not be confirmed/u);
+  assert.equal(result.steps.length, 1);
+  assert.equal(driver.mutatingCalls().length, 1);
+  assert.ok(
+    traces.events.some((event) => event.event === "session_cleanup_failed"),
+  );
+  assert.ok(
+    !traces.events.some((event) => event.event === "session_cleanup_succeeded"),
+  );
+
+  const callsAfterFailure = driver.calls.length;
+  const blocked = await subject.run(
+    isolatedRequest("cleanup-failure-follow-up"),
+  );
+  assert.equal(blocked.outcome, "unknown");
+  assert.match(blocked.reason, /blocked until the prior run is reconciled/u);
+  assert.equal(driver.calls.length, callsAfterFailure);
+  assert.equal(driver.mutatingCalls().length, 1);
+});
+
+test("decision gating uses the controller's explicit expected model identity", async (t) => {
+  const directory = await stateDirectory(t);
+  const driver = new FakeDriver([
+    observation(false),
+    observation(false),
+    observation(true),
+  ]);
+  const expectedModel = "deterministic-closed-set-v1";
+  const policy = new FunctionPolicy(({ candidates }) =>
+    Promise.resolve(decisionFor(candidates, { model: expectedModel })),
+  );
+  const subject = controller(
+    directory,
+    driver,
+    policy,
+    new MemoryTraceSink(),
+    expectedModel,
+  );
+
+  const result = await subject.run(isolatedRequest("explicit-model-run"));
+
+  assert.equal(result.outcome, "verified");
+  assert.equal(result.model, expectedModel);
+  assert.equal(driver.mutatingCalls().length, 1);
 });
 
 test("a low-confidence decision is rejected without dispatching an action", async (t) => {
@@ -654,6 +785,38 @@ test("a low-confidence decision is rejected without dispatching an action", asyn
       (event) => event.event === "decision" && event.gate === "reject",
     ),
   );
+  assert.ok(!traces.events.some((event) => event.event === "action_started"));
+});
+
+test("an invalid provider distribution is traced with usage and never dispatched", async (t) => {
+  const directory = await stateDirectory(t);
+  const driver = new FakeDriver([observation(false)]);
+  const traces = new MemoryTraceSink();
+  const policy = new FunctionPolicy(({ candidates }) => {
+    const decision = decisionFor(candidates);
+    return Promise.resolve({
+      ...decision,
+      probabilities: Object.fromEntries(
+        candidates.map((candidate) => [candidate.id, 0.1]),
+      ),
+    });
+  });
+  const subject = controller(directory, driver, policy, traces);
+
+  const result = await subject.run(
+    isolatedRequest("invalid-provider-distribution"),
+  );
+
+  assert.equal(result.outcome, "unknown");
+  assert.match(result.reason, /failed local decision validation/u);
+  assert.equal(result.frontierFallbackRecommended, true);
+  assert.deepEqual(driver.mutatingCalls(), []);
+  const failure = traces.events.find(
+    (event) => event.event === "decision_validation_failed",
+  );
+  assert.equal(failure?.input_tokens, 13);
+  assert.equal(failure?.output_tokens, 5);
+  assert.equal(failure?.decision_ms, 4);
   assert.ok(!traces.events.some((event) => event.event === "action_started"));
 });
 
@@ -737,6 +900,10 @@ test("an ambiguous mutating failure is never retried", async (t) => {
   assert.equal(failures[0]?.ambiguous, true);
   assert.ok(traces.events.some((event) => event.event === "action_started"));
   assert.ok(!traces.events.some((event) => event.event === "action_returned"));
+  assert.equal(
+    (await new LiveExecutionBarrier(directory).status()).state,
+    "reconciliation_required",
+  );
 });
 
 test("a completed idempotency key returns the cached result without reconnecting or acting", async (t) => {

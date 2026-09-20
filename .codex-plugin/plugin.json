@@ -1,6 +1,6 @@
 {
   "name": "jev-cua",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260920055237",
   "description": "Run bounded computer-use workflows through a local Cua Driver and TypeSafe Jev fast path.",
   "author": {
     "name": "Eronmonsele Aigbiluese",

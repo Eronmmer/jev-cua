@@ -49,6 +49,53 @@ describe("Cua 0.28.2 mutation receipts", () => {
     }
   });
 
+  test("rejects silent fallback outside the requested delivery route", () => {
+    for (const [tool, arguments_, route] of [
+      [
+        "browser_click",
+        {
+          target_id: "target",
+          tab_id: "tab",
+          ref: "p2:4",
+          input_route: "dom_event",
+        },
+        "accessibility",
+      ],
+      [
+        "browser_pointer",
+        {
+          target_id: "target",
+          tab_id: "tab",
+          ref: "p2:6",
+          action: "scroll",
+          input_route: "trusted",
+        },
+        "global_input",
+      ],
+      [
+        "browser_type",
+        {
+          target_id: "target",
+          tab_id: "tab",
+          ref: "p2:2",
+          text: "abc",
+          mode: "insert_text",
+        },
+        "dom",
+      ],
+    ] as const) {
+      assert.throws(
+        () =>
+          validateStructuredReceipt(tool, arguments_, {
+            effect: "unverifiable",
+            route,
+          }),
+        (error: unknown) =>
+          error instanceof DriverToolError && error.ambiguousExecution,
+      );
+    }
+  });
+
   test("requires the exact prepare and navigation receipts", () => {
     assert.doesNotThrow(() =>
       validateStructuredReceipt(
@@ -89,6 +136,26 @@ describe("Cua 0.28.2 mutation receipts", () => {
           refs_invalidated: true,
         },
       ),
+    );
+  });
+
+  test("requires a positive session-cleanup receipt", () => {
+    assert.doesNotThrow(() =>
+      validateStructuredReceipt(
+        "end_session",
+        { session: "run" },
+        { active: false, session: "run" },
+      ),
+    );
+    assert.throws(
+      () =>
+        validateStructuredReceipt(
+          "end_session",
+          { session: "run" },
+          { active: false, session: "other" },
+        ),
+      (error: unknown) =>
+        error instanceof DriverToolError && !error.ambiguousExecution,
     );
   });
 });

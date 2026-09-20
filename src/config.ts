@@ -54,8 +54,9 @@ export function loadRuntimeConfig(
       : "warn";
 
   return Object.freeze({
-    // Model and gates are a calibrated safety boundary. Environment variables
-    // must not silently swap or weaken them in a production MCP launch.
+    // Model and conservative experimental gates are pinned. They are not a
+    // substitute for per-workflow calibration, and environment variables must
+    // not silently swap or weaken them in a production MCP launch.
     model: PINNED_JEV_MODEL,
     providerTimeoutMs: boundedInteger(
       env.JEV_CUA_PROVIDER_TIMEOUT_MS,

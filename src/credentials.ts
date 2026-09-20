@@ -1,8 +1,11 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 
+import { trustedHelperEnvironment } from "./runtime/child-environment.js";
+
 const execFile = promisify(execFileCallback);
 export const TYPESAFE_KEYCHAIN_SERVICE = "ai.typesafe.jev-cua";
+export const TYPESAFE_KEYCHAIN_ACCOUNT = "typesafe-api-key";
 
 export type CredentialSource = "environment" | "keychain" | "missing";
 
@@ -22,8 +25,19 @@ export async function loadTypeSafeCredential(
   try {
     const { stdout } = await execFile(
       "/usr/bin/security",
-      ["find-generic-password", "-s", TYPESAFE_KEYCHAIN_SERVICE, "-w"],
-      { timeout: 1_500, maxBuffer: 16 * 1024 },
+      [
+        "find-generic-password",
+        "-s",
+        TYPESAFE_KEYCHAIN_SERVICE,
+        "-a",
+        TYPESAFE_KEYCHAIN_ACCOUNT,
+        "-w",
+      ],
+      {
+        timeout: 1_500,
+        maxBuffer: 16 * 1024,
+        env: trustedHelperEnvironment(process.env, { userDirectories: true }),
+      },
     );
     const key = stdout.trim();
     return key

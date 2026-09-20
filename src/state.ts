@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import {
   access,
@@ -6,6 +6,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   rename,
   unlink,
 } from "node:fs/promises";
@@ -25,6 +26,10 @@ function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
 
 async function ensurePrivateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
+  await assertPrivateDirectory(path);
+}
+
+async function assertPrivateDirectory(path: string): Promise<void> {
   const handle = await open(
     path,
     constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
@@ -90,9 +95,19 @@ async function syncDirectory(path: string): Promise<void> {
     } finally {
       await handle.close();
     }
-  } catch {
-    // Some platforms do not permit fsync on directories. File fsync and atomic
-    // rename still preserve the strongest contract available there.
+  } catch (error: unknown) {
+    // Some filesystems explicitly do not implement directory fsync. Propagate
+    // real I/O and capacity failures rather than silently weakening durability.
+    if (
+      isErrno(error, "EINVAL") ||
+      isErrno(error, "ENOTSUP") ||
+      isErrno(error, "EOPNOTSUPP") ||
+      (process.platform === "win32" &&
+        (isErrno(error, "EBADF") || isErrno(error, "EPERM")))
+    ) {
+      return;
+    }
+    throw error;
   }
 }
 
@@ -120,6 +135,37 @@ async function atomicWriteJson(
     await unlink(temporary).catch(() => undefined);
     throw error;
   }
+}
+
+async function publishPrivateFileNoReplace(
+  path: string,
+  directory: string,
+  data: string | Buffer,
+): Promise<void> {
+  await ensurePrivateDirectory(directory);
+  const preparedPath = join(
+    directory,
+    `.prepared-${process.pid}-${Date.now()}-${randomBytes(8).toString("hex")}`,
+  );
+  const handle = await open(preparedPath, "wx", 0o600);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    // A hard link publishes the fully fsynced inode atomically and refuses to
+    // replace an existing safety authority file.
+    await link(preparedPath, path);
+    await syncDirectory(directory);
+  } catch (error: unknown) {
+    await unlink(preparedPath).catch(() => undefined);
+    throw error;
+  }
+  // The final pathname is already durable. A stranded prepared hard link is
+  // harmless and ignored by scanners if cleanup itself is interrupted.
+  await unlink(preparedPath).catch(() => undefined);
 }
 
 async function processIsAlive(pid: number): Promise<boolean> {
@@ -252,12 +298,176 @@ export class DesktopLease {
   }
 }
 
+type ExecutionBarrierState =
+  | "active"
+  | "cleanup_unconfirmed"
+  | "reconciliation_required";
+
+type ExecutionBarrierRecord = Readonly<{
+  schema: "jev-cua.execution-safety-barrier.v1";
+  runId: string;
+  session: string;
+  state: ExecutionBarrierState;
+  markedAt: string;
+  updatedAt: string;
+}>;
+
+export class LiveExecutionBarrier {
+  private readonly path: string;
+
+  constructor(private readonly stateDirectory: string) {
+    this.path = join(stateDirectory, "live-execution-blocked.json");
+  }
+
+  async assertClear(): Promise<void> {
+    const status = await this.status();
+    if (status.blocked) {
+      throw new Error(
+        "live browser execution is blocked by an unresolved prior execution",
+      );
+    }
+  }
+
+  async markActive(runId: string, session: string): Promise<void> {
+    await ensurePrivateDirectory(this.stateDirectory);
+    const now = new Date().toISOString();
+    const record: ExecutionBarrierRecord = Object.freeze({
+      schema: "jev-cua.execution-safety-barrier.v1",
+      runId,
+      session,
+      state: "active",
+      markedAt: now,
+      updatedAt: now,
+    });
+    await publishPrivateFileNoReplace(
+      this.path,
+      this.stateDirectory,
+      JSON.stringify(record),
+    );
+  }
+
+  async retain(
+    runId: string,
+    session: string,
+    state: Exclude<ExecutionBarrierState, "active">,
+  ): Promise<void> {
+    const record = await this.readOwnedRecord(runId, session);
+    await atomicWriteJson(this.path, this.stateDirectory, {
+      ...record,
+      state,
+      updatedAt: new Date().toISOString(),
+    } satisfies ExecutionBarrierRecord);
+  }
+
+  async clear(runId: string, session: string): Promise<void> {
+    await this.readOwnedRecord(runId, session);
+    await unlink(this.path);
+    await syncDirectory(this.stateDirectory);
+  }
+
+  async archiveResolved(runId: string, session: string): Promise<string> {
+    await this.readOwnedRecord(runId, session);
+    const archiveDirectory = join(
+      this.stateDirectory,
+      "reconciled-execution-barriers",
+    );
+    await ensurePrivateDirectory(archiveDirectory);
+    const destination = join(
+      archiveDirectory,
+      `${new Date().toISOString().replace(/[^0-9]/gu, "")}-${createHash("sha256").update(runId, "utf8").digest("hex").slice(0, 16)}-${randomBytes(4).toString("hex")}.json`,
+    );
+    await rename(this.path, destination);
+    await Promise.all([
+      syncDirectory(this.stateDirectory),
+      syncDirectory(archiveDirectory),
+    ]);
+    return destination;
+  }
+
+  async status(): Promise<
+    Readonly<{
+      blocked: boolean;
+      runId?: string;
+      session?: string;
+      state?: ExecutionBarrierState;
+      markedAt?: string;
+      updatedAt?: string;
+    }>
+  > {
+    try {
+      const record = await readPrivateJson<Partial<ExecutionBarrierRecord>>(
+        this.path,
+        16_384,
+      );
+      if (
+        record.schema !== "jev-cua.execution-safety-barrier.v1" ||
+        typeof record.runId !== "string" ||
+        typeof record.session !== "string" ||
+        !isExecutionBarrierState(record.state) ||
+        typeof record.markedAt !== "string" ||
+        typeof record.updatedAt !== "string"
+      ) {
+        return Object.freeze({ blocked: true });
+      }
+      return Object.freeze({
+        blocked: true,
+        runId: record.runId,
+        session: record.session,
+        state: record.state,
+        markedAt: record.markedAt,
+        updatedAt: record.updatedAt,
+      });
+    } catch (error: unknown) {
+      if (isErrno(error, "ENOENT")) return Object.freeze({ blocked: false });
+      // A malformed, unsafe, or unreadable barrier must fail closed.
+      return Object.freeze({ blocked: true });
+    }
+  }
+
+  private async readOwnedRecord(
+    runId: string,
+    session: string,
+  ): Promise<ExecutionBarrierRecord> {
+    const record = await readPrivateJson<Partial<ExecutionBarrierRecord>>(
+      this.path,
+      16_384,
+    );
+    if (
+      record.schema !== "jev-cua.execution-safety-barrier.v1" ||
+      record.runId !== runId ||
+      record.session !== session ||
+      !isExecutionBarrierState(record.state) ||
+      typeof record.markedAt !== "string" ||
+      typeof record.updatedAt !== "string"
+    ) {
+      throw new Error(
+        "execution safety barrier is not owned by this browser session",
+      );
+    }
+    return record as ExecutionBarrierRecord;
+  }
+}
+
+function isExecutionBarrierState(
+  value: unknown,
+): value is ExecutionBarrierState {
+  return (
+    value === "active" ||
+    value === "cleanup_unconfirmed" ||
+    value === "reconciliation_required"
+  );
+}
+
 export type RunPhase =
   | "reserved"
   | "browser_setup_started"
   | "browser_setup_returned"
   | "action_started"
   | "action_returned";
+
+export function activeRunRequiresReconciliation(phase: RunPhase): boolean {
+  return phase !== "reserved";
+}
 
 export type RunOperationDescriptor = Readonly<{
   policyFingerprint: string;
@@ -284,13 +494,27 @@ export type StoredRun =
       result: RunResult;
     }>;
 
+type ReconciliationAcknowledgement = Readonly<{
+  schema: "jev-cua.reconciliation-acknowledgement.v1";
+  runId: string;
+  runRecordSha256: string;
+  reason:
+    | "barrier_owned_reserved"
+    | "interrupted_live_run"
+    | "cleanup_unconfirmed"
+    | "workflow_reconciliation_required";
+  acknowledgedAt: string;
+}>;
+
 export class RunStore {
   private readonly runsDirectory: string;
+  private readonly reconciliationsDirectory: string;
   private readonly identityKeyPath: string;
   private identityKeyPromise: Promise<Buffer> | undefined;
 
   constructor(stateDirectory: string) {
     this.runsDirectory = join(stateDirectory, "runs");
+    this.reconciliationsDirectory = join(stateDirectory, "reconciliations");
     this.identityKeyPath = join(stateDirectory, "identity.key");
   }
 
@@ -309,15 +533,11 @@ export class RunStore {
     const stateDirectory = join(this.runsDirectory, "..");
     await ensurePrivateDirectory(stateDirectory);
     try {
-      const handle = await open(this.identityKeyPath, "wx", 0o600);
-      try {
-        const key = randomBytes(32);
-        await handle.writeFile(key);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await syncDirectory(stateDirectory);
+      await publishPrivateFileNoReplace(
+        this.identityKeyPath,
+        stateDirectory,
+        randomBytes(32),
+      );
     } catch (error: unknown) {
       if (!isErrno(error, "EEXIST")) throw error;
     }
@@ -372,14 +592,11 @@ export class RunStore {
       phase: "reserved",
     });
     try {
-      const handle = await open(path, "wx", 0o600);
-      try {
-        await handle.writeFile(JSON.stringify(record), "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await syncDirectory(this.runsDirectory);
+      await publishPrivateFileNoReplace(
+        path,
+        this.runsDirectory,
+        JSON.stringify(record),
+      );
       return { activeElsewhere: false, runKeyHash };
     } catch (error: unknown) {
       if (!isErrno(error, "EEXIST")) throw error;
@@ -453,6 +670,358 @@ export class RunStore {
       throw error;
     }
   }
+
+  async auditExisting(): Promise<
+    Readonly<{
+      totalRecords: number;
+      activeRecords: number;
+      completeRecords: number;
+      malformedRecords: number;
+    }>
+  > {
+    try {
+      await assertPrivateDirectory(this.runsDirectory);
+    } catch (error: unknown) {
+      if (isErrno(error, "ENOENT")) {
+        return Object.freeze({
+          totalRecords: 0,
+          activeRecords: 0,
+          completeRecords: 0,
+          malformedRecords: 0,
+        });
+      }
+      throw error;
+    }
+
+    let totalRecords = 0;
+    let activeRecords = 0;
+    let completeRecords = 0;
+    let malformedRecords = 0;
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
+      totalRecords += 1;
+      if (!entry.isFile() || entry.isSymbolicLink()) {
+        malformedRecords += 1;
+        continue;
+      }
+      let value: unknown;
+      try {
+        value = await readPrivateJson<unknown>(
+          join(this.runsDirectory, entry.name),
+        );
+      } catch {
+        malformedRecords += 1;
+        continue;
+      }
+      if (liveExecutionBlockReason(value) === "malformed_run_record") {
+        malformedRecords += 1;
+        continue;
+      }
+      const record = value as Record<string, unknown>;
+      if (record.status === "active") activeRecords += 1;
+      else if (record.status === "complete") completeRecords += 1;
+      else malformedRecords += 1;
+    }
+    return Object.freeze({
+      totalRecords,
+      activeRecords,
+      completeRecords,
+      malformedRecords,
+    });
+  }
+
+  async liveExecutionStatus(): Promise<
+    Readonly<{
+      blocked: boolean;
+      blockerCount: number;
+      reasons: readonly string[];
+    }>
+  > {
+    await ensurePrivateDirectory(this.runsDirectory);
+    const reasons: string[] = [];
+    let blockerCount = 0;
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
+      if (!entry.isFile() || entry.isSymbolicLink()) {
+        blockerCount += 1;
+        reasons.push("unsafe_run_record");
+        continue;
+      }
+      let value: unknown;
+      let runRecordSha256: string;
+      try {
+        const { data } = await readPrivateFile(
+          join(this.runsDirectory, entry.name),
+          1_048_576,
+        );
+        runRecordSha256 = createHash("sha256").update(data).digest("hex");
+        value = JSON.parse(data.toString("utf8")) as unknown;
+      } catch {
+        blockerCount += 1;
+        reasons.push("unreadable_run_record");
+        continue;
+      }
+      const reason = liveExecutionBlockReason(value);
+      const runId = storedRunId(value);
+      if (
+        reason &&
+        (!reasonMayBeAcknowledged(reason) ||
+          !runId ||
+          !(await this.hasReconciliationAcknowledgement(
+            runId,
+            runRecordSha256,
+            reason,
+          )))
+      ) {
+        blockerCount += 1;
+        reasons.push(reason);
+      }
+    }
+    return Object.freeze({
+      blocked: blockerCount > 0,
+      blockerCount,
+      reasons: Object.freeze([...new Set(reasons)]),
+    });
+  }
+
+  async assertSafeForLiveExecution(): Promise<void> {
+    const status = await this.liveExecutionStatus();
+    if (status.blocked) {
+      throw new Error(
+        "live browser execution is blocked by an unresolved durable run record",
+      );
+    }
+  }
+
+  async acknowledgeReconciliation(
+    runId: string,
+    options: Readonly<{ barrierOwnerConfirmed?: boolean }> = {},
+  ): Promise<ReconciliationAcknowledgement> {
+    if (!isNonemptyString(runId)) throw new Error("run ID cannot be empty");
+    await ensurePrivateDirectory(this.runsDirectory);
+    const matches: Array<{ value: unknown; sha256: string }> = [];
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
+      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+      try {
+        const { data } = await readPrivateFile(
+          join(this.runsDirectory, entry.name),
+          1_048_576,
+        );
+        const value = JSON.parse(data.toString("utf8")) as unknown;
+        if (storedRunId(value) === runId) {
+          matches.push({
+            value,
+            sha256: createHash("sha256").update(data).digest("hex"),
+          });
+        }
+      } catch {
+        // A malformed record is not eligible for acknowledgement. The normal
+        // scanner continues to fail closed on it.
+      }
+    }
+    if (matches.length !== 1) {
+      throw new Error(
+        "the exact run ID did not identify one durable run record",
+      );
+    }
+    const match = matches[0]!;
+    const reason = reconciliationReasonForRecovery(
+      match.value,
+      options.barrierOwnerConfirmed === true,
+    );
+    if (!reason) {
+      throw new Error("the identified run does not require reconciliation");
+    }
+    const acknowledgement: ReconciliationAcknowledgement = Object.freeze({
+      schema: "jev-cua.reconciliation-acknowledgement.v1",
+      runId,
+      runRecordSha256: match.sha256,
+      reason,
+      acknowledgedAt: new Date().toISOString(),
+    });
+    await ensurePrivateDirectory(this.reconciliationsDirectory);
+    await atomicWriteJson(
+      this.reconciliationPath(runId),
+      this.reconciliationsDirectory,
+      acknowledgement,
+    );
+    return acknowledgement;
+  }
+
+  private reconciliationPath(runId: string): string {
+    const digest = createHash("sha256").update(runId, "utf8").digest("hex");
+    return join(this.reconciliationsDirectory, `${digest}.json`);
+  }
+
+  private async hasReconciliationAcknowledgement(
+    runId: string,
+    runRecordSha256: string,
+    reason: string,
+  ): Promise<boolean> {
+    try {
+      const acknowledgement = await readPrivateJson<
+        Partial<ReconciliationAcknowledgement>
+      >(this.reconciliationPath(runId), 16_384);
+      return (
+        acknowledgement.schema ===
+          "jev-cua.reconciliation-acknowledgement.v1" &&
+        acknowledgement.runId === runId &&
+        acknowledgement.runRecordSha256 === runRecordSha256 &&
+        acknowledgement.reason === reason &&
+        typeof acknowledgement.acknowledgedAt === "string"
+      );
+    } catch {
+      return false;
+    }
+  }
+}
+
+function storedRunId(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const record = value as Record<string, unknown>;
+  if (record.status === "active") {
+    return isNonemptyString(record.runId) ? record.runId : undefined;
+  }
+  if (
+    record.status !== "complete" ||
+    !record.result ||
+    typeof record.result !== "object" ||
+    Array.isArray(record.result)
+  ) {
+    return;
+  }
+  const runId = (record.result as Record<string, unknown>).runId;
+  return isNonemptyString(runId) ? runId : undefined;
+}
+
+function reasonMayBeAcknowledged(reason: string): boolean {
+  return (
+    reason === "interrupted_live_run" ||
+    reason === "cleanup_unconfirmed" ||
+    reason === "workflow_reconciliation_required"
+  );
+}
+
+function reconciliationReasonForRecovery(
+  value: unknown,
+  barrierOwnerConfirmed: boolean,
+): ReconciliationAcknowledgement["reason"] | undefined {
+  const reason = liveExecutionBlockReason(value);
+  if (reason && reasonMayBeAcknowledged(reason)) {
+    return reason as ReconciliationAcknowledgement["reason"];
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const record = value as Record<string, unknown>;
+  if (
+    barrierOwnerConfirmed &&
+    ((record.status === "active" && record.phase === "reserved") ||
+      (record.status === "complete" && record.lastPhase === "reserved"))
+  ) {
+    return "barrier_owned_reserved";
+  }
+  return;
+}
+
+function liveExecutionBlockReason(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "malformed_run_record";
+  }
+  const record = value as Record<string, unknown>;
+  if (record.status === "active") {
+    if (
+      !isRunPhase(record.phase) ||
+      !isNonemptyString(record.runId) ||
+      !isSha256(record.runKeyHash) ||
+      !isSha256(record.requestFingerprint) ||
+      !isNonemptyString(record.startedAt) ||
+      !Number.isSafeInteger(record.pid) ||
+      Number(record.pid) <= 0
+    ) {
+      return "malformed_run_record";
+    }
+    return activeRunRequiresReconciliation(record.phase)
+      ? "interrupted_live_run"
+      : undefined;
+  }
+  if (
+    record.status !== "complete" ||
+    !isRunPhase(record.lastPhase) ||
+    !isSha256(record.requestFingerprint)
+  ) {
+    return "malformed_run_record";
+  }
+  if (
+    !record.result ||
+    typeof record.result !== "object" ||
+    Array.isArray(record.result)
+  ) {
+    return "malformed_run_record";
+  }
+  const result = record.result as Record<string, unknown>;
+  if (
+    !isNonemptyString(result.runId) ||
+    !isSha256(result.runKeyHash) ||
+    !isOutcome(result.outcome) ||
+    typeof result.reconciliationRequired !== "boolean" ||
+    (result.cleanupSucceeded !== null &&
+      typeof result.cleanupSucceeded !== "boolean")
+  ) {
+    return "malformed_run_record";
+  }
+  // A reservation alone cannot have launched a browser or dispatched input.
+  // Preflight refusals may conservatively report reconciliationRequired, but
+  // they must not poison later live work after the real blocker is resolved.
+  if (record.lastPhase === "reserved") return undefined;
+  if (result.cleanupSucceeded === false) return "cleanup_unconfirmed";
+  if (result.cleanupSucceeded !== true) {
+    return "cleanup_unconfirmed";
+  }
+  if (result.reconciliationRequired === true) {
+    return "workflow_reconciliation_required";
+  }
+  if (record.lastPhase === "action_started") {
+    return "workflow_reconciliation_required";
+  }
+  if (record.lastPhase === "action_returned" && result.outcome !== "verified") {
+    return "workflow_reconciliation_required";
+  }
+  return undefined;
+}
+
+function isRunPhase(value: unknown): value is RunPhase {
+  return (
+    value === "reserved" ||
+    value === "browser_setup_started" ||
+    value === "browser_setup_returned" ||
+    value === "action_started" ||
+    value === "action_returned"
+  );
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function isOutcome(value: unknown): boolean {
+  return [
+    "verified",
+    "refuted",
+    "unknown",
+    "abstained",
+    "approval_required",
+    "denied",
+    "budget_exhausted",
+    "setup_required",
+    "shadow_complete",
+  ].includes(String(value));
 }
 
 export class JsonlTraceSink implements TraceSink {

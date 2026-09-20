@@ -39,4 +39,12 @@ test("durable policy fingerprints bind workflow bytes, model, gates, and policy 
       model: "jev-other",
     }),
   );
+  assert.notEqual(
+    first,
+    workflowPolicyFingerprint(
+      "a".repeat(64),
+      baseConfig,
+      "deterministic-closed-set-v1",
+    ),
+  );
 });

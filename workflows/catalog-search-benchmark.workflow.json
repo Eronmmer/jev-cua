@@ -1,0 +1,179 @@
+{
+  "schema": "jev-cua.workflow.v1",
+  "id": "catalog-search-benchmark",
+  "version": 1,
+  "enabled": true,
+  "description": "Credential-free catalog search, price-sort, and sale-filter quality check against the owned immutable benchmark fixture.",
+  "goal": "Set the fixed benchmark catalog query, price order, and sale filter, then reach the exact deterministic completion state.",
+  "target": {
+    "kind": "isolated",
+    "start_url": "https://jev-cua-benchmark-fixture.erons.workers.dev/v6/catalog-search",
+    "navigation_effect": "read_only_landing"
+  },
+  "allowed_origins": ["https://jev-cua-benchmark-fixture.erons.workers.dev"],
+  "inputs": [
+    {
+      "id": "search_query",
+      "description": "Fixed public benchmark search query",
+      "target_hints": ["Search products — JEV-CUA-CATALOG-SEARCH-V6"],
+      "classification": "public",
+      "max_length": 7,
+      "enum": ["chicken"],
+      "allowed_disclosure_origins": [
+        "https://jev-cua-benchmark-fixture.erons.workers.dev"
+      ]
+    },
+    {
+      "id": "sort_state",
+      "description": "Expected fixed public price-sort state",
+      "target_hints": ["Sort state"],
+      "classification": "public",
+      "max_length": 9,
+      "enum": ["price_low"],
+      "allowed_disclosure_origins": [
+        "https://jev-cua-benchmark-fixture.erons.workers.dev"
+      ]
+    },
+    {
+      "id": "completion_state",
+      "description": "Expected fixed public benchmark completion state",
+      "target_hints": ["Benchmark completion state"],
+      "classification": "public",
+      "max_length": 8,
+      "enum": ["complete"],
+      "allowed_disclosure_origins": [
+        "https://jev-cua-benchmark-fixture.erons.workers.dev"
+      ]
+    }
+  ],
+  "success": {
+    "kind": "exact_field_equals",
+    "page": {
+      "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+      "pathname": "/v6/catalog-search"
+    },
+    "field": {
+      "role": "textbox",
+      "name": "Benchmark completion state"
+    },
+    "input_id": "completion_state"
+  },
+  "steps": [
+    {
+      "id": "enter_search_query",
+      "description": "Replace the exact search field with the fixed public benchmark query.",
+      "page": {
+        "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+        "pathname": "/v6/catalog-search"
+      },
+      "requires": [],
+      "action": {
+        "kind": "type",
+        "field": {
+          "role": "textbox",
+          "name": "Search products — JEV-CUA-CATALOG-SEARCH-V6"
+        },
+        "input_id": "search_query",
+        "effect": "public_data_entry"
+      },
+      "ensures": {
+        "kind": "exact_field_equals",
+        "page": {
+          "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+          "pathname": "/v6/catalog-search"
+        },
+        "field": {
+          "role": "textbox",
+          "name": "Search products — JEV-CUA-CATALOG-SEARCH-V6"
+        },
+        "input_id": "search_query"
+      }
+    },
+    {
+      "id": "set_price_order",
+      "description": "Activate the exact low-to-high price-order control.",
+      "page": {
+        "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+        "pathname": "/v6/catalog-search"
+      },
+      "requires": [
+        {
+          "kind": "field_equals",
+          "field": {
+            "role": "textbox",
+            "name": "Search products — JEV-CUA-CATALOG-SEARCH-V6"
+          },
+          "input_id": "search_query"
+        }
+      ],
+      "action": {
+        "kind": "click",
+        "control": {
+          "role": "button",
+          "name": "Sort by price low to high — JEV-CUA-CATALOG-SEARCH-V6"
+        },
+        "input_route": "dom_event",
+        "effect": "reversible_navigation"
+      },
+      "ensures": {
+        "kind": "exact_field_equals",
+        "page": {
+          "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+          "pathname": "/v6/catalog-search"
+        },
+        "field": {
+          "role": "textbox",
+          "name": "Sort state"
+        },
+        "input_id": "sort_state"
+      }
+    },
+    {
+      "id": "enable_sale_filter",
+      "description": "Activate the exact sale-filter control after the fixed query and price order are proven.",
+      "page": {
+        "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+        "pathname": "/v6/catalog-search"
+      },
+      "requires": [
+        {
+          "kind": "field_equals",
+          "field": {
+            "role": "textbox",
+            "name": "Search products — JEV-CUA-CATALOG-SEARCH-V6"
+          },
+          "input_id": "search_query"
+        },
+        {
+          "kind": "field_equals",
+          "field": {
+            "role": "textbox",
+            "name": "Sort state"
+          },
+          "input_id": "sort_state"
+        }
+      ],
+      "action": {
+        "kind": "click",
+        "control": {
+          "role": "checkbox",
+          "name": "On sale only — JEV-CUA-CATALOG-SEARCH-V6"
+        },
+        "input_route": "dom_event",
+        "effect": "reversible_navigation"
+      },
+      "ensures": {
+        "kind": "exact_field_equals",
+        "page": {
+          "origin": "https://jev-cua-benchmark-fixture.erons.workers.dev",
+          "pathname": "/v6/catalog-search"
+        },
+        "field": {
+          "role": "textbox",
+          "name": "Benchmark completion state"
+        },
+        "input_id": "completion_state"
+      }
+    }
+  ]
+}

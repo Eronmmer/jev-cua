@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 
+import { trustedHelperEnvironment } from "../runtime/child-environment.js";
 import type { CompiledWorkflow } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -41,7 +42,12 @@ async function readMacOsKeychainSecret(
     const { stdout } = await execFileAsync(
       "/usr/bin/security",
       ["find-generic-password", "-s", service, "-a", account, "-w"],
-      { encoding: "utf8", maxBuffer: 4096, timeout: 5_000 },
+      {
+        encoding: "utf8",
+        maxBuffer: 4096,
+        timeout: 5_000,
+        env: trustedHelperEnvironment(process.env, { userDirectories: true }),
+      },
     );
     return stdout.trim();
   } catch (error: unknown) {

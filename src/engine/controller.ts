@@ -12,7 +12,7 @@ import { DriverToolError } from "../cua/client.js";
 import { gateDecision } from "../policy/gate.js";
 import { candidateMayExecuteAutomatically } from "../policy/risk.js";
 import { validateCandidateSet } from "../policy/validate-candidates.js";
-import { DesktopLease, RunStore } from "../state.js";
+import { DesktopLease, LiveExecutionBarrier, RunStore } from "../state.js";
 import type {
   CandidateBuilder,
   DecisionPolicy,
@@ -36,9 +36,44 @@ const REQUIRED_TOOLS = new Set([
 
 type FinishInput = Omit<
   RunResult,
-  "finishedAt" | "reconciliationRequired" | "safeToRetry"
+  "finishedAt" | "reconciliationRequired" | "safeToRetry" | "cleanupSucceeded"
 > &
-  Partial<Pick<RunResult, "reconciliationRequired" | "safeToRetry">>;
+  Partial<
+    Pick<
+      RunResult,
+      "reconciliationRequired" | "safeToRetry" | "cleanupSucceeded"
+    >
+  >;
+
+class SessionCleanupError extends Error {
+  constructor(
+    readonly preliminaryResult: RunResult | undefined,
+    readonly cleanupSucceeded: boolean,
+    options: ErrorOptions,
+  ) {
+    super(
+      "browser session finalization could not be safely completed",
+      options,
+    );
+    this.name = "SessionCleanupError";
+  }
+}
+
+class UnexpectedExecutionError extends Error {
+  cleanupSucceeded: boolean | null = null;
+
+  constructor(
+    readonly original: unknown,
+    readonly mutationAttempted: boolean,
+    readonly recordedSteps: readonly StepTrace[],
+    readonly decisionModel: string | undefined,
+  ) {
+    super("browser execution failed outside an expected stop path", {
+      cause: original,
+    });
+    this.name = "UnexpectedExecutionError";
+  }
+}
 
 function reconcileWorkflowProgress(
   observation: Parameters<typeof verifySuccess>[0],
@@ -63,10 +98,14 @@ export class FastpathController {
       config: RuntimeConfig;
       lease: DesktopLease;
       runs: RunStore;
+      safetyRuns: RunStore;
+      executionBarrier: LiveExecutionBarrier;
+      isolatedCleanupResolvesReconciliation: boolean;
       traces: TraceSink;
       candidateBuilder: CandidateBuilder;
       candidateSemanticPrefix: string;
       policyFingerprint: string;
+      expectedDecisionModel: string;
     }>,
   ) {}
 
@@ -78,7 +117,8 @@ export class FastpathController {
     executionSignal.throwIfAborted();
     if (
       !/^[a-f0-9]{64}$/u.test(this.dependencies.policyFingerprint) ||
-      !this.dependencies.candidateSemanticPrefix.trim()
+      !this.dependencies.candidateSemanticPrefix.trim() ||
+      !this.dependencies.expectedDecisionModel.trim()
     ) {
       throw new Error("controller has no trusted compiled policy identity");
     }
@@ -133,6 +173,7 @@ export class FastpathController {
         frontierFallbackRecommended: false,
         reconciliationRequired: true,
         safeToRetry: false,
+        cleanupSucceeded: null,
       });
     }
 
@@ -146,6 +187,7 @@ export class FastpathController {
         reason:
           "The pinned workflow and inputs passed local validation. Shadow mode launched no browser and dispatched no computer input.",
         frontierFallbackRecommended: false,
+        cleanupSucceeded: null,
       });
       await this.dependencies.runs.complete(shadow);
       return shadow;
@@ -155,24 +197,51 @@ export class FastpathController {
     let result: RunResult;
     try {
       release = await this.dependencies.lease.acquire(runId);
-      result = await this.execute(
+      await this.dependencies.executionBarrier.assertClear();
+      await this.dependencies.safetyRuns.assertSafeForLiveExecution();
+      const executed = await this.execute(
         runId,
         begun.runKeyHash,
         startedAt,
         request,
         executionSignal,
       );
+      // execute() returns only after its session-finally block has completed.
+      // Record the externally visible finish after cleanup, not before it.
+      result = Object.freeze({
+        ...executed,
+        finishedAt: new Date().toISOString(),
+      });
     } catch (error: unknown) {
+      const cleanupFailure =
+        error instanceof SessionCleanupError ? error : undefined;
+      const executionFailure =
+        error instanceof UnexpectedExecutionError ? error : undefined;
+      const preliminary = cleanupFailure?.preliminaryResult;
       result = this.finish({
         runId,
         runKeyHash: begun.runKeyHash,
         startedAt,
-        steps: [],
+        steps: preliminary?.steps ?? executionFailure?.recordedSteps ?? [],
         outcome: "unknown",
-        reason: classifyFailure(error),
+        reason: cleanupFailure?.cleanupSucceeded
+          ? "The browser session ended, but the durable execution safety barrier could not be finalized. The action will not be replayed; inspect the prior run before further live work."
+          : cleanupFailure
+            ? "The workflow stopped after browser work, but isolated session cleanup could not be confirmed. The action will not be replayed; reconcile the prior run and Cua sessions before further live work."
+            : classifyFailure(executionFailure?.original ?? error),
+        ...(preliminary?.model
+          ? { model: preliminary.model }
+          : executionFailure?.decisionModel
+            ? { model: executionFailure.decisionModel }
+            : {}),
         frontierFallbackRecommended: false,
-        reconciliationRequired: true,
+        reconciliationRequired:
+          cleanupFailure !== undefined ||
+          executionFailure?.mutationAttempted === true,
         safeToRetry: false,
+        cleanupSucceeded: cleanupFailure
+          ? cleanupFailure.cleanupSucceeded
+          : (executionFailure?.cleanupSucceeded ?? null),
       });
     } finally {
       if (release) await release();
@@ -207,7 +276,7 @@ export class FastpathController {
       }
     }
 
-    const session = `jev-cua-${runId.slice(0, 12)}`;
+    const session = `jev-cua-${runId.replaceAll("-", "").slice(0, 12)}`;
     const traces: StepTrace[] = [];
     const startedMonotonic = performance.now();
     let priorDigest: string | undefined;
@@ -216,19 +285,27 @@ export class FastpathController {
     const attemptedActions = new Set<string>();
     const completedActions = new Set<string>();
     let mutationAttempted = false;
-    const finish = (input: FinishInput): RunResult =>
-      this.finish(
+    let executionBarrierMarked = false;
+    let unexpectedFailure: UnexpectedExecutionError | undefined;
+    let preliminaryResult: RunResult | undefined;
+    const finish = (input: FinishInput): RunResult => {
+      preliminaryResult = this.finish(
         mutationAttempted && input.outcome !== "verified"
           ? {
               ...input,
               frontierFallbackRecommended: false,
               reconciliationRequired: true,
               safeToRetry: false,
+              cleanupSucceeded: true,
             }
-          : input,
+          : { ...input, cleanupSucceeded: true },
       );
+      return preliminaryResult;
+    };
 
     try {
+      await this.dependencies.executionBarrier.markActive(runId, session);
+      executionBarrierMarked = true;
       if (request.target.kind === "isolated") {
         await this.dependencies.runs.markPhase(
           runKeyHash,
@@ -406,13 +483,37 @@ export class FastpathController {
           });
         }
         lastModel = decision.model;
-        const gate = gateDecision({
-          decision,
-          candidates,
-          observationDigest: observation.digest,
-          expectedModel: this.dependencies.config.model,
-          thresholds: this.dependencies.config.thresholds,
-        });
+        let gate;
+        try {
+          gate = gateDecision({
+            decision,
+            candidates,
+            observationDigest: observation.digest,
+            expectedModel: this.dependencies.expectedDecisionModel,
+            thresholds: this.dependencies.config.thresholds,
+          });
+        } catch (error: unknown) {
+          await this.trace(runId, {
+            event: "decision_validation_failed",
+            step,
+            decision_ms: decision.latencyMs,
+            input_tokens: decision.inputTokens,
+            output_tokens: decision.outputTokens,
+            model: decision.model,
+            error: error instanceof Error ? error.name : "UnknownError",
+          });
+          return finish({
+            runId,
+            runKeyHash,
+            startedAt,
+            steps: traces,
+            outcome: "unknown",
+            reason:
+              "The provider response failed local decision validation; no action was dispatched.",
+            model: lastModel,
+            frontierFallbackRecommended: true,
+          });
+        }
         const baseTrace = {
           step,
           candidateCount: candidates.length,
@@ -601,8 +702,9 @@ export class FastpathController {
           risk: actionCandidate.risk,
         });
         const actionStarted = performance.now();
+        let actionReceipt: Readonly<Record<string, unknown>>;
         try {
-          await this.dependencies.driver.call(
+          actionReceipt = await this.dependencies.driver.call(
             action.tool,
             withSession(action.arguments, session),
             signal ? { signal } : undefined,
@@ -642,7 +744,8 @@ export class FastpathController {
         const actionMs = elapsed(actionStarted);
         let postVerified = false;
         let stepVerified = false;
-        let postVerificationMs: number;
+        const postVerificationStarted = performance.now();
+        let postVerificationMs = 0;
         try {
           await this.dependencies.runs.markPhase(
             runKeyHash,
@@ -654,8 +757,15 @@ export class FastpathController {
             step,
             operation_id: operationId,
             action_ms: actionMs,
+            delivery_route:
+              typeof actionReceipt.route === "string"
+                ? actionReceipt.route
+                : null,
+            delivery_effect:
+              typeof actionReceipt.effect === "string"
+                ? actionReceipt.effect
+                : null,
           });
-          const postVerificationStarted = performance.now();
           for (let attempt = 0; attempt < 8; attempt += 1) {
             const postObservation = await observeBrowser(
               this.dependencies.driver,
@@ -697,14 +807,21 @@ export class FastpathController {
             verification_ms: postVerificationMs,
           });
         } catch (error: unknown) {
+          postVerificationMs = elapsed(postVerificationStarted);
           traces.push(
-            Object.freeze({ ...baseTrace, actionMs, outcome: "unknown" }),
+            Object.freeze({
+              ...baseTrace,
+              actionMs,
+              verificationMs: postVerificationMs,
+              outcome: "unknown",
+            }),
           );
           await this.trace(runId, {
             event: "postcondition_failed",
             step,
             operation_id: operationId,
             error: error instanceof Error ? error.name : "UnknownError",
+            verification_ms: postVerificationMs,
           }).catch(() => undefined);
           return finish({
             runId,
@@ -752,11 +869,53 @@ export class FastpathController {
         model: lastModel,
         frontierFallbackRecommended: true,
       });
+    } catch (error: unknown) {
+      unexpectedFailure = new UnexpectedExecutionError(
+        error,
+        mutationAttempted,
+        Object.freeze([...traces]),
+        lastModel,
+      );
+      throw unexpectedFailure;
     } finally {
-      try {
-        await this.dependencies.driver.call("end_session", { session });
-      } catch {
-        // Session cleanup cannot justify replaying or changing the run outcome.
+      if (executionBarrierMarked) {
+        let cleanupConfirmed = false;
+        try {
+          await this.dependencies.driver.call("end_session", { session });
+          cleanupConfirmed = true;
+          await this.trace(runId, { event: "session_cleanup_succeeded" });
+          const retainForReconciliation =
+            !this.dependencies.isolatedCleanupResolvesReconciliation &&
+            (preliminaryResult?.reconciliationRequired === true ||
+              (mutationAttempted && preliminaryResult?.outcome !== "verified"));
+          if (retainForReconciliation) {
+            await this.dependencies.executionBarrier.retain(
+              runId,
+              session,
+              "reconciliation_required",
+            );
+          } else {
+            await this.dependencies.executionBarrier.clear(runId, session);
+          }
+          if (unexpectedFailure) unexpectedFailure.cleanupSucceeded = true;
+        } catch (error: unknown) {
+          if (!cleanupConfirmed) {
+            await this.dependencies.executionBarrier
+              .retain(runId, session, "cleanup_unconfirmed")
+              .catch(() => undefined);
+          }
+          // Cleanup failure never justifies replaying a workflow action. Record a
+          // content-free signal so batch callers can stop before another session.
+          if (!cleanupConfirmed) {
+            await this.trace(runId, {
+              event: "session_cleanup_failed",
+              error: error instanceof Error ? error.name : "UnknownError",
+            }).catch(() => undefined);
+          }
+          throw new SessionCleanupError(preliminaryResult, cleanupConfirmed, {
+            cause: error,
+          });
+        }
       }
     }
   }
@@ -764,15 +923,24 @@ export class FastpathController {
   private finish(
     input: Omit<
       RunResult,
-      "finishedAt" | "reconciliationRequired" | "safeToRetry"
+      | "finishedAt"
+      | "reconciliationRequired"
+      | "safeToRetry"
+      | "cleanupSucceeded"
     > &
-      Partial<Pick<RunResult, "reconciliationRequired" | "safeToRetry">>,
+      Partial<
+        Pick<
+          RunResult,
+          "reconciliationRequired" | "safeToRetry" | "cleanupSucceeded"
+        >
+      >,
   ): RunResult {
     return Object.freeze({
       ...input,
       steps: Object.freeze([...input.steps]),
       reconciliationRequired: input.reconciliationRequired ?? false,
       safeToRetry: input.safeToRetry ?? false,
+      cleanupSucceeded: input.cleanupSucceeded ?? null,
       finishedAt: new Date().toISOString(),
     });
   }
@@ -804,5 +972,7 @@ function classifyFailure(error: unknown): string {
     return "The physical desktop is busy with another controller run.";
   if (error instanceof Error && error.message.includes("permission"))
     return "Cua Driver requires desktop permissions or setup.";
+  if (error instanceof Error && error.message.includes("unresolved"))
+    return "Live browser execution is blocked until the prior run is reconciled.";
   return `The run failed before a verified outcome (${error instanceof Error ? error.name : "UnknownError"}).`;
 }

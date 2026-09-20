@@ -3,6 +3,8 @@ import { constants } from "node:fs";
 import { access, lstat, realpath } from "node:fs/promises";
 import { promisify } from "node:util";
 
+import { trustedHelperEnvironment } from "../runtime/child-environment.js";
+
 import type { DriverToolDescriptor } from "../types.js";
 
 const execFile = promisify(execFileCallback);
@@ -52,6 +54,7 @@ export type CuaCompatibility = Readonly<{
   versionMatches: boolean;
   requiredToolsPresent: boolean;
   receiptSchemasMatch: boolean;
+  cleanupReceiptSchemaMatches: boolean;
   reasons: readonly string[];
 }>;
 
@@ -107,7 +110,11 @@ export async function verifyCuaDriverProvenance(
         CUA_DESIGNATED_REQUIREMENT,
         CUA_APP,
       ],
-      { timeout: 10_000, maxBuffer: 64 * 1024 },
+      {
+        timeout: 10_000,
+        maxBuffer: 64 * 1024,
+        env: trustedHelperEnvironment(),
+      },
     );
     await access(CUA_EXECUTABLE, constants.X_OK);
   } catch (error: unknown) {
@@ -161,6 +168,27 @@ function actionReceiptSchemaMatches(
   });
 }
 
+function cleanupReceiptSchemaMatches(
+  tool: DriverToolDescriptor | undefined,
+): boolean {
+  const alternatives = tool?.outputSchema?.anyOf;
+  if (!Array.isArray(alternatives)) return false;
+  return alternatives.some((alternative) => {
+    const branch = record(alternative);
+    const properties = record(branch?.properties);
+    const active = record(properties?.active);
+    const session = record(properties?.session);
+    const required = branch?.required;
+    return (
+      Array.isArray(required) &&
+      required.includes("active") &&
+      required.includes("session") &&
+      active?.const === false &&
+      session?.type === "string"
+    );
+  });
+}
+
 export function assessCuaCompatibility(
   version: string,
   tools: readonly DriverToolDescriptor[],
@@ -186,11 +214,22 @@ export function assessCuaCompatibility(
       `unsupported action receipt schema: ${incompatibleReceipts.join(", ")}`,
     );
   }
+  const cleanupReceiptMatches = cleanupReceiptSchemaMatches(
+    byName.get("end_session"),
+  );
+  if (!cleanupReceiptMatches) {
+    reasons.push("unsupported session-cleanup receipt schema");
+  }
   return Object.freeze({
-    compatible: versionMatches && requiredToolsPresent && receiptSchemasMatch,
+    compatible:
+      versionMatches &&
+      requiredToolsPresent &&
+      receiptSchemasMatch &&
+      cleanupReceiptMatches,
     versionMatches,
     requiredToolsPresent,
     receiptSchemasMatch,
+    cleanupReceiptSchemaMatches: cleanupReceiptMatches,
     reasons: Object.freeze(reasons),
   });
 }

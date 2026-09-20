@@ -1,7 +1,5 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { userInfo } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,29 +7,25 @@ import { z } from "zod";
 
 import { loadRuntimeConfig } from "./config.js";
 import { loadTypeSafeCredential } from "./credentials.js";
-import {
-  CuaMcpClient,
-  DriverToolError,
-  resolveCuaDriverBinary,
-} from "./cua/client.js";
-import {
-  assessCuaCompatibility,
-  verifyCuaDriverProvenance,
-} from "./cua/compatibility.js";
-import { FastpathController } from "./engine/controller.js";
+import { CuaMcpClient, resolveCuaDriverBinary } from "./cua/client.js";
+import { cuaReadinessFailure, probeCuaReadiness } from "./cua/readiness.js";
 import { TypeSafeDecisionPolicy } from "./jev/typesafe-policy.js";
-import { workflowPolicyFingerprint } from "./policy/fingerprint.js";
+import { createCompiledWorkflowRuntime } from "./runtime/workflow-controller.js";
 import {
   DesktopLease,
   JsonlTraceSink,
+  LiveExecutionBarrier,
   RunStore,
+  activeRunRequiresReconciliation,
   pathIsExecutable,
 } from "./state.js";
 import type { JsonValue, RunResult } from "./types.js";
 import {
-  buildCompiledWorkflowCandidates,
-  compiledWorkflowStepRisk,
-} from "./workflows/compiler.js";
+  assertSupportedNodeRuntime,
+  isSupportedNodeVersion,
+  MINIMUM_NODE_VERSION,
+} from "./runtime/node-version.js";
+import { compiledWorkflowStepRisk } from "./workflows/compiler.js";
 import {
   acquireWorkflowApproval,
   readWorkflowApproval,
@@ -41,7 +35,8 @@ import {
   loadWorkflowManifests,
 } from "./workflows/manifest.js";
 
-const execFile = promisify(execFileCallback);
+assertSupportedNodeRuntime();
+
 const VERSION = "0.1.0";
 
 const workflowRunSchema = z
@@ -62,29 +57,12 @@ type Runtime = Readonly<{
   driver: CuaMcpClient;
   lease: DesktopLease;
   runs: RunStore;
+  executionBarrier: LiveExecutionBarrier;
   config: ReturnType<typeof loadRuntimeConfig>;
   traces: JsonlTraceSink;
 }>;
 
 let runtimePromise: Promise<Runtime> | undefined;
-
-async function readCuaTelemetryStatus(binary: string): Promise<{
-  enabled: boolean;
-  source: string | null;
-}> {
-  const { stdout } = await execFile(binary, ["telemetry", "status", "--json"], {
-    timeout: 5_000,
-    maxBuffer: 64 * 1024,
-  });
-  const value = JSON.parse(stdout) as Record<string, unknown>;
-  if (typeof value.enabled !== "boolean") {
-    throw new Error("Cua telemetry status is malformed");
-  }
-  return {
-    enabled: value.enabled,
-    source: typeof value.source === "string" ? value.source : null,
-  };
-}
 
 async function runtime(): Promise<Runtime> {
   if (!runtimePromise) {
@@ -102,11 +80,13 @@ async function runtime(): Promise<Runtime> {
       );
       const lease = new DesktopLease(trustedRuntimeState);
       const runs = new RunStore(trustedRuntimeState);
+      const executionBarrier = new LiveExecutionBarrier(trustedRuntimeState);
       return Object.freeze({
         binary,
         driver,
         lease,
         runs,
+        executionBarrier,
         config,
         traces: new JsonlTraceSink(config.stateDirectory),
       });
@@ -144,64 +124,25 @@ server.registerTool(
   async () => {
     const current = await runtime();
     const credential = await loadTypeSafeCredential();
-    let driverVersion: string | null = null;
-    let driverTools: number | null = null;
-    let driverError: string | null = null;
-    let driverRefusalCode: string | null = null;
-    let health: Record<string, unknown> | null = null;
-    let permissions: Record<string, unknown> | null = null;
-    let requiredToolsPresent = false;
-    let receiptSchemasMatch = false;
-    let driverContractCompatible = false;
-    let compatibilityReasons: readonly string[] = [];
-    let provenanceTrusted = false;
-    let provenanceReasons: readonly string[] = [];
-    let telemetry: { enabled: boolean; source: string | null } | null = null;
-    try {
-      const provenance = await verifyCuaDriverProvenance(current.binary);
-      provenanceTrusted = provenance.trusted;
-      provenanceReasons = provenance.reasons;
-      if (!provenance.trusted) {
-        driverError = "UntrustedDriver";
-      } else {
-        const { stdout } = await execFile(current.binary, ["--version"], {
-          timeout: 5_000,
-          maxBuffer: 64 * 1024,
-        });
-        driverVersion = stdout.trim().slice(0, 160);
-        telemetry = await readCuaTelemetryStatus(current.binary);
-        const tools = await current.driver.listTools();
-        driverTools = tools.length;
-        const compatibility = assessCuaCompatibility(driverVersion, tools);
-        requiredToolsPresent = compatibility.requiredToolsPresent;
-        receiptSchemasMatch = compatibility.receiptSchemasMatch;
-        driverContractCompatible = compatibility.compatible;
-        compatibilityReasons = compatibility.reasons;
-        health = await current.driver.call("health_report", {});
-        permissions = await current.driver.call("check_permissions", {
-          prompt: false,
-        });
-      }
-    } catch (error: unknown) {
-      driverError = error instanceof Error ? error.name : "UnknownError";
-      driverRefusalCode =
-        error instanceof DriverToolError ? (error.refusalCode ?? null) : null;
-    }
-    const permissionsReady =
-      permissions?.accessibility === true &&
-      permissions?.screen_recording === true;
-    const driverReady =
-      Boolean(driverVersion) &&
-      provenanceTrusted &&
-      driverContractCompatible &&
-      health?.schema_version === "1" &&
-      health.overall === "ok" &&
-      permissionsReady &&
-      telemetry?.enabled === false &&
-      !driverError;
+    const readiness = await probeCuaReadiness(current.binary, current.driver);
+    const [executionBarrier, durableRuns] = await Promise.all([
+      current.executionBarrier.status(),
+      current.runs.liveExecutionStatus(),
+    ]);
     return toolResult({
-      status: driverReady && credential.apiKey ? "ready" : "setup_required",
+      status:
+        readiness.ready &&
+        credential.apiKey &&
+        !executionBarrier.blocked &&
+        !durableRuns.blocked
+          ? "ready"
+          : "setup_required",
       runtime_version: VERSION,
+      node_runtime: {
+        current: process.versions.node,
+        minimum: MINIMUM_NODE_VERSION,
+        supported: isSupportedNodeVersion(process.versions.node),
+      },
       build: process.env.JEV_CUA_BUILD_SHA?.trim() || "development",
       cua: {
         binary: current.binary,
@@ -209,21 +150,23 @@ server.registerTool(
           current.binary === "cua-driver"
             ? null
             : await pathIsExecutable(current.binary),
-        version: driverVersion,
-        advertised_tools: driverTools,
-        required_tools_present: requiredToolsPresent,
-        action_receipt_schemas_match: receiptSchemasMatch,
-        contract_compatible: driverContractCompatible,
-        compatibility_reasons: compatibilityReasons,
-        provenance_trusted: provenanceTrusted,
-        provenance_reasons: provenanceReasons,
-        telemetry,
-        health,
-        permissions,
-        error: driverError,
-        refusal_code: driverRefusalCode,
+        version: readiness.driverVersion,
+        advertised_tools: readiness.driverTools,
+        required_tools_present: readiness.requiredToolsPresent,
+        action_receipt_schemas_match: readiness.receiptSchemasMatch,
+        cleanup_receipt_schema_matches: readiness.cleanupReceiptSchemaMatches,
+        contract_compatible: readiness.driverContractCompatible,
+        compatibility_reasons: readiness.compatibilityReasons,
+        provenance_trusted: readiness.provenanceTrusted,
+        provenance_reasons: readiness.provenanceReasons,
+        telemetry: readiness.telemetry,
+        health: readiness.health,
+        permissions: readiness.permissions,
+        error: readiness.driverError,
+        refusal_code: readiness.driverRefusalCode,
         setup_command:
-          driverRefusalCode === "permissions_pending"
+          readiness.driverRefusalCode === "permissions_pending" ||
+          (readiness.permissions !== null && !readiness.permissionsReady)
             ? "cua-driver permissions grant"
             : null,
       },
@@ -233,6 +176,10 @@ server.registerTool(
         model: current.config.model,
       },
       desktop_lease: await current.lease.status(),
+      live_execution_safety: {
+        barrier: executionBarrier,
+        durable_runs: durableRuns,
+      },
     });
   },
 );
@@ -326,49 +273,12 @@ server.registerTool(
       });
     }
     if (input.mode === "live") {
-      try {
-        const provenance = await verifyCuaDriverProvenance(current.binary);
-        if (!provenance.trusted) {
-          return toolResult({
-            outcome: "setup_required",
-            reason: `The Cua Driver binary is not from the reviewed signed installation: ${provenance.reasons.join("; ")}.`,
-            frontier_fallback_recommended: false,
-            reconciliation_required: false,
-            safe_to_retry: false,
-          });
-        }
-        const [{ stdout }, tools, telemetry] = await Promise.all([
-          execFile(current.binary, ["--version"], {
-            timeout: 5_000,
-            maxBuffer: 64 * 1024,
-          }),
-          current.driver.listTools(),
-          readCuaTelemetryStatus(current.binary),
-        ]);
-        if (telemetry.enabled) {
-          return toolResult({
-            outcome: "setup_required",
-            reason:
-              "Cua telemetry is enabled. Run `cua-driver telemetry disable` before live workflows.",
-            frontier_fallback_recommended: false,
-            reconciliation_required: false,
-            safe_to_retry: false,
-          });
-        }
-        const compatibility = assessCuaCompatibility(stdout.trim(), tools);
-        if (!compatibility.compatible) {
-          return toolResult({
-            outcome: "setup_required",
-            reason: `The installed Cua Driver does not match the reviewed runtime contract: ${compatibility.reasons.join("; ")}.`,
-            frontier_fallback_recommended: false,
-            reconciliation_required: false,
-            safe_to_retry: false,
-          });
-        }
-      } catch (error: unknown) {
+      const readiness = await probeCuaReadiness(current.binary, current.driver);
+      const readinessFailure = cuaReadinessFailure(readiness);
+      if (readinessFailure) {
         return toolResult({
           outcome: "setup_required",
-          reason: `The reviewed Cua Driver runtime contract could not be verified (${error instanceof Error ? error.name : "UnknownError"}).`,
+          reason: `The reviewed Cua Driver runtime is not ready: ${readinessFailure}.`,
           frontier_fallback_recommended: false,
           reconciliation_required: false,
           safe_to_retry: false,
@@ -390,49 +300,31 @@ server.registerTool(
         safe_to_retry: false,
       });
     }
-    const policyFingerprint = workflowPolicyFingerprint(
-      invocation.workflow.digest,
-      current.config,
-    );
-    const controller = new FastpathController({
+    const execution = createCompiledWorkflowRuntime({
       driver: current.driver,
       policy: TypeSafeDecisionPolicy.create(
         apiKey ?? "shadow-not-used",
         current.config,
       ),
+      decisionPolicyIdentity: current.config.model,
       config: current.config,
       lease: current.lease,
       runs: current.runs,
+      safetyRuns: current.runs,
+      executionBarrier: current.executionBarrier,
       traces: current.traces,
-      candidateBuilder: ({ observation, values, completedSemanticKeys }) =>
-        buildCompiledWorkflowCandidates({
-          workflow: invocation.workflow,
-          observation,
-          values,
-          completedSemanticKeys,
-          ...(authorization.capability
-            ? { approval: authorization.capability }
-            : {}),
-        }),
-      candidateSemanticPrefix: `workflow:${invocation.workflow.id}:${invocation.workflow.version}:`,
-      policyFingerprint,
+      workflow: invocation.workflow,
+      values: invocation.values,
+      ...(authorization.capability
+        ? { approval: authorization.capability }
+        : {}),
     });
-    const result = await controller.run(
-      Object.freeze({
+    const result = await execution.controller.run(
+      execution.createRequest({
         runKey: input.run_key,
-        policyFingerprint,
-        goal: invocation.workflow.goal,
-        target: invocation.workflow.target,
-        values: invocation.values,
-        success: invocation.workflow.success,
-        allowedOrigins: invocation.workflow.allowedOrigins,
         mode: input.mode,
         maxSteps: input.max_steps,
         maxWallTimeMs: input.max_wall_time_ms,
-        workflowSteps: invocation.workflow.steps.map((step) => ({
-          semanticKey: `workflow:${invocation.workflow.id}:${invocation.workflow.version}:${step.id}`,
-          ensures: step.ensures,
-        })),
       }),
       extra.signal,
     );
@@ -482,10 +374,9 @@ server.registerTool(
     const stored = await current.runs.get(run_key);
     if (!stored) return toolResult({ status: "not_found" });
     if (stored.status === "active") {
-      const reconciliationRequired =
-        stored.phase === "browser_setup_started" ||
-        stored.phase === "action_started" ||
-        stored.phase === "action_returned";
+      const reconciliationRequired = activeRunRequiresReconciliation(
+        stored.phase,
+      );
       return toolResult({
         status: "active_or_unknown",
         run_id: stored.runId,
@@ -533,6 +424,7 @@ function publicRunResult(result: RunResult): Record<string, JsonValue> {
     frontier_fallback_recommended: result.frontierFallbackRecommended,
     reconciliation_required: result.reconciliationRequired,
     safe_to_retry: result.safeToRetry,
+    cleanup_succeeded: result.cleanupSucceeded ?? null,
   };
 }
 

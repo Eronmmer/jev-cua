@@ -4,7 +4,7 @@ export default defineConfig({
   entry: { server: "src/server.ts" },
   format: ["cjs"],
   platform: "node",
-  target: "node22",
+  target: "node24",
   outDir: "mcp",
   clean: true,
   splitting: false,

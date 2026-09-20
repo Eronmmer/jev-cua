@@ -164,6 +164,7 @@ export type RunResult = Readonly<{
   frontierFallbackRecommended: boolean;
   reconciliationRequired: boolean;
   safeToRetry: boolean;
+  cleanupSucceeded: boolean | null;
 }>;
 
 export type DriverToolDescriptor = Readonly<{

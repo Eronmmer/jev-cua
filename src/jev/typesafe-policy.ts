@@ -26,6 +26,13 @@ function validateUnitInterval(value: unknown, field: string): number {
   return value;
 }
 
+function validateTokenCount(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`TypeSafe returned invalid ${field}`);
+  }
+  return value;
+}
+
 export class TypeSafeDecisionPolicy implements DecisionPolicy {
   constructor(
     private readonly client: TypeSafeClientLike,
@@ -159,8 +166,14 @@ export class TypeSafeDecisionPolicy implements DecisionPolicy {
       probabilities: Object.freeze(probabilities),
       selectedFit: validateUnitInterval(fit.noul, "fit probability"),
       model: response.model,
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      inputTokens: validateTokenCount(
+        response.usage?.input_tokens,
+        "input token count",
+      ),
+      outputTokens: validateTokenCount(
+        response.usage?.output_tokens,
+        "output token count",
+      ),
       latencyMs,
     });
   }

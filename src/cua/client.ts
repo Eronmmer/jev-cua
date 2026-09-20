@@ -7,6 +7,9 @@ import {
   getDefaultEnvironment,
   StdioClientTransport,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import { Ajv } from "ajv";
+import formatsPlugin from "ajv-formats";
 
 import type {
   DriverClient,
@@ -16,6 +19,28 @@ import type {
 import { asRecord } from "../util.js";
 
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+
+function createCuaSchemaValidator(): AjvJsonSchemaValidator {
+  const ajv = new Ajv({
+    strict: false,
+    validateFormats: true,
+    validateSchema: false,
+    allErrors: true,
+  });
+  const addFormats = formatsPlugin as unknown as (instance: Ajv) => Ajv;
+  addFormats(ajv);
+  ajv.addFormat("uint32", {
+    type: "number",
+    validate: (value: number) =>
+      Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff,
+  });
+  ajv.addFormat("uint64", {
+    type: "number",
+    // JSON numbers above this bound cannot preserve exact integer identity.
+    validate: (value: number) => Number.isSafeInteger(value) && value >= 0,
+  });
+  return new AjvJsonSchemaValidator(ajv);
+}
 
 export class DriverToolError extends Error {
   constructor(
@@ -113,7 +138,10 @@ export class CuaMcpClient implements DriverClient {
     // Cua writes diagnostics only to stderr. Drain it so a long-lived nested
     // server cannot deadlock on pipe backpressure; never forward raw output.
     transport.stderr?.on("data", () => undefined);
-    const client = new Client({ name: "jev-cua", version: "0.1.0" });
+    const client = new Client(
+      { name: "jev-cua", version: "0.1.0" },
+      { jsonSchemaValidator: createCuaSchemaValidator() },
+    );
     client.onclose = () => {
       if (this.client === client) {
         this.client = undefined;
@@ -257,6 +285,20 @@ export function validateStructuredReceipt(
   arguments_: Readonly<Record<string, JsonValue>>,
   data: Readonly<Record<string, unknown>>,
 ): void {
+  if (tool === "end_session") {
+    if (
+      data.active !== false ||
+      (typeof arguments_.session === "string" &&
+        data.session !== arguments_.session)
+    ) {
+      throw new DriverToolError(
+        tool,
+        false,
+        `${tool} returned no positive cleanup receipt`,
+      );
+    }
+    return;
+  }
   if (!MUTATING_TOOLS.has(tool)) return;
   if (tool === "browser_prepare") {
     if (data.status !== "ok") {
@@ -341,6 +383,24 @@ export function validateStructuredReceipt(
         tool,
         true,
         `${tool} returned no supported dispatch receipt`,
+      );
+    }
+    const expectedRoute = (() => {
+      if (tool === "browser_type") {
+        return arguments_.mode === "insert_text" ||
+          arguments_.mode === "keystrokes"
+          ? "trusted_input"
+          : null;
+      }
+      if (arguments_.input_route === "dom_event") return "dom";
+      if (arguments_.input_route === "trusted") return "trusted_input";
+      return null;
+    })();
+    if (expectedRoute === null || data.route !== expectedRoute) {
+      throw new DriverToolError(
+        tool,
+        true,
+        `${tool} receipt did not match the requested delivery route`,
       );
     }
     if (

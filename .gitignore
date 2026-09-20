@@ -3,6 +3,10 @@ dist/
 .DS_Store
 *.log
 runs/
+benchmark-results/
+.wrangler/
+benchmark-fixture/.wrangler/
+benchmark-fixture/worker-configuration.d.ts
 .env
 .env.*
 !.env.example

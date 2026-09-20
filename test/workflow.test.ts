@@ -78,6 +78,45 @@ describe("compiled workflow manifests", () => {
     assert.equal(fixture.steps.length, 2);
   });
 
+  test("binds every benchmark action to the exact visible v6 fixture contract", async () => {
+    const manifests = await loadWorkflowManifests(
+      join(process.cwd(), "workflows"),
+    );
+    const benchmark = manifests.find(
+      (entry) => entry.id === "catalog-search-benchmark",
+    );
+    assert.ok(benchmark);
+    assert.equal(
+      benchmark.target.startUrl,
+      "https://jev-cua-benchmark-fixture.erons.workers.dev/v6/catalog-search",
+    );
+    assert.equal(
+      benchmark.inputs.some((input) => input.id === "fixture_contract"),
+      false,
+    );
+    const actionNames = benchmark.steps.map((step) =>
+      step.action.kind === "type"
+        ? step.action.field.name
+        : step.action.kind === "click"
+          ? step.action.control.name
+          : step.action.region.name,
+    );
+    assert.deepEqual(actionNames, [
+      "Search products — JEV-CUA-CATALOG-SEARCH-V6",
+      "Sort by price low to high — JEV-CUA-CATALOG-SEARCH-V6",
+      "On sale only — JEV-CUA-CATALOG-SEARCH-V6",
+    ]);
+    for (const step of benchmark.steps) {
+      assert.equal(step.page.pathname, "/v6/catalog-search");
+    }
+    assert.equal(
+      benchmark.success.kind === "exact_field_equals"
+        ? benchmark.success.page.pathname
+        : null,
+      "/v6/catalog-search",
+    );
+  });
+
   test("binds exactly the declared inputs and rejects additions or omissions", async () => {
     const compiled = await workflow();
     const invocation = bindWorkflowInputs(compiled, {

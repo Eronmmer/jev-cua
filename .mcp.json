@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "jev-cua": {
-      "command": "node",
-      "args": ["./mcp/server.cjs"],
+      "command": "/bin/sh",
+      "args": ["./scripts/run-mcp.sh"],
       "cwd": ".",
       "env_vars": [
         "TYPESAFE_API_KEY",

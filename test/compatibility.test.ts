@@ -56,7 +56,25 @@ function actionTool(name: string): DriverToolDescriptor {
 
 function reviewedTools(): DriverToolDescriptor[] {
   return [
-    ...required.map((name) => ({ name })),
+    ...required
+      .filter((name) => name !== "end_session")
+      .map((name) => ({ name })),
+    {
+      name: "end_session",
+      outputSchema: {
+        type: "object",
+        anyOf: [
+          {
+            type: "object",
+            required: ["session", "active"],
+            properties: {
+              session: { type: "string" },
+              active: { const: false },
+            },
+          },
+        ],
+      },
+    },
     actionTool("browser_click"),
     actionTool("browser_type"),
     actionTool("browser_pointer"),
@@ -92,6 +110,18 @@ describe("Cua runtime trust contract", () => {
     );
     assert.equal(assessment.compatible, false);
     assert.equal(assessment.receiptSchemasMatch, false);
+
+    const changedCleanup = reviewedTools().map((tool) =>
+      tool.name === "end_session"
+        ? { name: "end_session", outputSchema: { type: "object" } }
+        : tool,
+    );
+    const cleanupAssessment = assessCuaCompatibility(
+      PINNED_CUA_DRIVER_VERSION,
+      changedCleanup,
+    );
+    assert.equal(cleanupAssessment.compatible, false);
+    assert.equal(cleanupAssessment.cleanupReceiptSchemaMatches, false);
   });
 
   test(
