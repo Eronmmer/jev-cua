@@ -51,6 +51,8 @@ jev_cua_native_visual_observe
 
 The visual fallback currently targets clicks whose intended result remains observable through Accessibility. Text entry and key presses require a returned Accessibility capability. Fully AX-unobservable canvases and remote-desktop surfaces are intentionally not claimed as supported because screenshot motion cannot safely prove the intended action succeeded.
 
+One concrete Cua 0.28.2 limitation is macOS Calculator: its buttons are in the window Accessibility snapshot, but its display/result is not. Jev Cua therefore refuses to claim a verified multi-button calculation; action receipts alone cannot prove the displayed answer. A future driver-provided semantic result or a separately reviewed local visual verifier is required for that workflow.
+
 Prefer a purpose-built connector, API, or CLI when one covers the task. Those surfaces are faster and easier to verify. Use the compiled mode below when a repeated browser task exactly matches a reviewed workflow.
 
 ## Compiled fast-path contract
