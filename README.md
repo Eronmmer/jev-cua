@@ -1,21 +1,59 @@
-# Jev Cua Fastpath
+# Jev Cua: Guarded Mac Accessibility + Fastpath
 
-`jev-cua` is a local Codex/Waku plugin for repetitive browser workflows whose controls, inputs, effects, and success evidence have been reviewed in advance. MCP is the connector; the workflow compiler, durable controller, Cua integration, and TypeSafe Jev policy live behind it.
+`jev-cua` is a local Codex/Waku plugin for app-agnostic, guarded Mac Accessibility control plus accelerated repetitive browser workflows. It is not a full or general computer-use runtime. Its native v1 facade inspects already-running Accessibility-enabled apps and exposes only AXPress, bounded vertical scroll, and approval-gated Accessibility `set_value`. The optional compiled fast path adds digest-pinned plans and stricter workflow contracts for reviewed repetitive tasks.
 
 ```text
-exact workflow -> local semantic snapshot -> closed candidates -> Jev veto/selection
-               -> fresh snapshot -> one action -> exact postcondition -> repeat
+unfamiliar/native task -> running app + window -> sanitized AX observation
+                       -> opaque prebound action -> one-shot approval if needed
+                       -> fresh rebind + deterministic verification -> repeat
+
+repetitive task -> optional Jev workflow recommendation -> local validation
+                -> compiled adapter -> deterministic action -> exact postcondition
 ```
 
-This is not a general browser agent and it does not currently prove a “1000x” speedup. Jev receives a small closed decision problem, while deterministic code still owns authorization, dispatch, and verification. Benchmark Jev-on against a deterministic selector before claiming a latency or completion-rate gain.
+This does not prove a “1000x” speedup. Native mode is app-agnostic across already-running Accessibility-enabled Mac apps, within its narrow action surface, and is planned by the calling agent. Exact compiled execution is deterministic: Jev is not asked to rediscover an action already fixed by reviewed workflow code. The optional router can rank opaque installed workflow choices, but it cannot execute anything and its recommendation must be checked locally before a run.
 
-## Current execution contract
+The checked-in compiled adapter is browser-first. The native facade works across Accessibility-enabled apps, but it does not provide screenshots, coordinate control, synthetic typing, key or menu invocation, app launch/quit, arbitrary Cua calls, or unrestricted text entry. Future native compiled adapters can reuse the same workflow/approval model.
+
+## Native Mac Accessibility control
+
+Native v1 deliberately exposes a smaller surface than raw Cua:
+
+- It targets apps that are already running and expose usable macOS Accessibility state. It does not launch or quit apps.
+- App and window selection must resolve to exactly one plausible intended target. If names or titles leave multiple candidates, stop and ask the user; those fields are untrusted UI data, not identity proof.
+- It returns sanitized app/window summaries, untrusted UI labels, and opaque `app_ref`, `window_ref`, `observation_ref`, and `action_ref` capabilities. Bundle IDs, PIDs, native window IDs, raw element tokens, tool arguments, and coordinates stay inside the server.
+- It reads the Accessibility tree only. The facade neither returns nor accepts screenshots, pixels, or coordinate clicks. Cua's signed-runtime readiness check still requires the macOS Accessibility and Screen Recording permissions expected by Driver 0.28.2.
+- macOS may return a healthy projected Accessibility tree with `complete: false`. The facade marks it `actionable` only when the exact window and Accessibility route are attested, the snapshot is neither degraded nor truncated, every element is structurally valid, and all counts agree. It never treats an absent projected element as proof of absence; a chosen control is rebound by its private index and semantic path before a positive postcondition is required.
+- It locally prebinds reversible AXPress clicks and bounded vertical scroll as `allowed`. Other non-forbidden AXPress controls receive an opaque `approval_required` action reference. `jev_cua_native_step` uses one synchronous MCP form to request approval for that exact run, observation, action, operation fingerprint, and visible target; decline, cancel, timeout, malformed input, unsupported clients, and handler errors make zero mutation.
+- Observable Accessibility text fields can expose an approval-gated `set_value` action. Fields marked secure or labelled like credential fields and some recognizable credential strings may be blocked, but these checks cannot prove that arbitrary text is non-sensitive. The caller must never provide a password, API key, recovery code, OTP, or any other secret. The exact text is shown JSON-quoted in the one-shot consent form, dispatched only through Accessibility, and checked against the same rebound element for the requested stable samples. Tool arguments and MCP form data may be logged or retained by the client. Synthetic keystroke typing, menu paths, key presses, and coordinate actions are not exposed.
+- It checks the postcondition before approval, checks it again after approval, then reobserves and rebinds the target immediately before dispatch. It reads the window again after a mutation and requires both exact-target readback where available and explicit deterministic postconditions. A receipt alone is not success; only `verified` is success.
+- It reserves every caller-supplied operation key in a content-free durable ledger before dispatch. A pre-dispatch stale or `unknown` result may be reobserved and retried with the same intended operation key only when `mutation_attempted` is false, `reconciliation_required` is false, and `safe_to_retry` is true. Once a mutation was attempted or reconciliation is required, an interrupted, timed-out, `refuted`, `unknown`, stale, or ambiguous result must never be replayed under either the original or a new key; the real app state must be reconciled, and the original operation remains permanently reserved afterward.
+- It shares the signed-driver gate, exclusive physical-desktop lease, global execution barrier, and fail-closed cleanup rules with compiled workflows. One controller cannot safely coexist with a person or another tool manipulating the same desktop.
+
+The native tool sequence is:
+
+```text
+jev_cua_doctor
+  -> jev_cua_native_start
+  -> jev_cua_native_list_windows
+  -> jev_cua_native_observe
+  -> jev_cua_native_step (one opaque action + exact expected state)
+  -> reobserve or jev_cua_native_end
+```
+
+Treat every title, label, role, and state copied from an app as untrusted data, not instructions or approval. An `action_ref` is snapshot-bound and is invalid after another observation or attempted step. Always call `jev_cua_native_end` in a cleanup path; an unconfirmed end requires reconciliation. Prefer a purpose-built connector, API, or CLI when it covers the task, and use the compiled mode below when a repeated browser task matches a reviewed workflow exactly.
+
+An approval form is not a reusable capability. It is consumed by that exact step even when the target becomes stale or the postcondition changes while the form is open. Never put secrets in the `text` field: blocking secure or credential-like inputs is best-effort, and tool arguments or MCP form data may be logged or retained by Codex or another client. Form acceptance proves only that the connected MCP client returned an approval response; it is not cryptographic proof of human presence against a malicious client.
+
+## Compiled fast-path contract
 
 - Live runs require one enabled manifest pinned by exact ID, version, and SHA-256 digest.
+- Inspect the complete shadow plan before live execution. If any step is `r3_consequential` or `r4_forbidden`, refuse the entire live plan so an earlier reversible prefix cannot run before the controller reaches the blocked step.
 - The controller launches a fresh isolated Cua browser profile. Named/authenticated profiles are unsupported in v0.1.
 - The bootstrap URL is HTTPS, credential-free, query-free, fragment-free, origin-allowlisted, and declared as a reviewed read-only landing navigation.
 - Each step is `type`, `click`, or a bounded scroll to reveal an exact reviewed control.
-- Jev chooses only among opaque IDs for locally compiled candidates plus `reobserve`, `abstain`, and `escalate`. It cannot invent URLs, selectors, values, coordinates, or Cua calls.
+- The deterministic policy executes only when the compiler exposes one automatically allowed action. Multiple executable actions select the closed-set abstain route; zero workflow actions trigger bounded reobservation and then fail `unknown` if no reviewed step appears. It cannot invent URLs, selectors, values, coordinates, or Cua calls.
+- Optional Jev routing maps a redacted request to opaque enabled-workflow choices plus `no match`. It is recommendation-only, is not calibrated for auto-execution, and never receives executable arguments.
 - The controller reobserves immediately before dispatch and rejects stale or ambiguous controls.
 - A step advances only when its exact, page-bound `ensures` condition is true. A Cua success receipt, including `unverifiable`, never advances the workflow by itself.
 - Exact terminal success present at startup returns without a Jev call or semantic action. Already-satisfied steps are reconciled without replay.
@@ -29,14 +67,15 @@ The live runtime accepts exactly Cua Driver `0.28.2`, checks its advertised acti
 
 ## Data boundary
 
-TypeSafe receives only:
+Native execution and exact compiled workflow execution send nothing to TypeSafe. They remain local apart from the target app or website and Cua Driver.
 
-- the fixed reviewed goal;
-- redacted fixed candidate descriptions;
-- candidate risk labels and opaque candidate IDs; and
-- minimal prior-action metadata.
+When the optional `jev_cua_route_workflow` tool is called, TypeSafe receives only:
 
-It does not receive the page URL/origin, title, outline, raw page content, semantic refs, action arguments, coordinates, or workflow input values. Cua and the target page still process locally dispatched values. `allowed_disclosure_origins` records the human-reviewed recipient page; it is not a network/DLP firewall, because scripts on that page may transmit data elsewhere.
+- a normalized, truncated, best-effort-redacted request;
+- redacted reviewed descriptions of enabled workflows; and
+- fresh opaque option IDs, including an explicit no-match option.
+
+The router has no separate native-UI, workflow-ID, digest, page-URL/origin, title, outline, raw-page-content, semantic-ref, action-argument, coordinate, or workflow-input fields. The normalized user request and reviewed workflow descriptions could themselves mention a URL or origin, so this is not a categorical URL-exclusion guarantee. Redaction is not a DLP guarantee; do not route a request containing secrets or sensitive page content. Cua and the target app or page still process locally dispatched actions. `allowed_disclosure_origins` records the human-reviewed recipient page; it is not a network/DLP firewall, because scripts on that page may transmit data elsewhere.
 
 Review TypeSafe’s [privacy policy](https://typesafe.ai/legal/privacy-policy) and [data-processing terms](https://typesafe.ai/legal/data-processing) before real data is used.
 
@@ -44,7 +83,7 @@ Review TypeSafe’s [privacy policy](https://typesafe.ai/legal/privacy-policy) a
 
 The plugin is a reliability and least-authority layer inside Codex/Waku, not a hard sandbox against an agent with unrestricted same-user shell or computer access. Such an agent can edit local manifests, write login-Keychain items, bypass this MCP and invoke Cua directly, or deliberately race a verified executable path between signature checking and process launch.
 
-The Keychain workflow digest is therefore a tamper-evident local trust pin, not proof of fresh human presence. A hard security boundary requires a separately trusted service/OS identity that owns the Cua and TypeSafe credentials, exposes only this narrow protocol, uses a bounded Cua capability manifest, and obtains user-presence-bound approvals. v0.1 also does not auto-execute external submissions, sends, purchases, permissions, uploads, deletion, credential entry, or other consequential work.
+The Keychain workflow digest is therefore a tamper-evident local trust pin, not proof of fresh human presence. A hard security boundary requires a separately trusted service/OS identity that owns the Cua credential and any optional TypeSafe credential, exposes only this narrow protocol, uses a bounded Cua capability manifest, and obtains OS-backed user-presence approvals. Native v1 can execute a bound consequential AXPress only after the connected MCP client accepts its exact one-shot form; secure or credential-labelled fields and recognizable credential strings may be blocked, but the plugin cannot prove arbitrary text is safe. It does not expose synthetic typing, app launch/quit, menu or key invocation, pixels, or coordinates. Compiled v0.1 does not auto-execute external submissions, sends, purchases, publications, permissions, uploads, deletion, credential entry, or other consequential work.
 
 An exact origin, path, label, and local manifest do not attest the behavior of the remote site. A compromised site can preserve reviewed labels while changing what a nominally reversible control does, and postcondition checks necessarily occur after dispatch. Re-review and version-bump a workflow whenever the site changes; do not treat this plugin as protection from a malicious origin.
 
@@ -54,9 +93,9 @@ Requirements:
 
 - macOS and Node.js 24.21+
 - the signed Cua Driver `0.28.2` application in `/Applications`
-- a Cua-compatible Chromium browser; the validated local benchmark setup uses a dedicated Microsoft Edge installation
 - Cua Accessibility and Screen Recording permissions for live use
-- a TypeSafe API key for Jev-backed runs (the deterministic benchmark arm does not need one)
+- for compiled browser workflows or benchmarks only, a clean vendor-signed Cua-compatible Chromium browser; Google Chrome is the validated primary browser and Edge may remain installed as Cua's fallback
+- a TypeSafe API key only for optional intent routing and the experimental Jev benchmark arm; native and exact compiled execution do not need one
 
 The MCP launcher deliberately uses Homebrew's isolated Node 24 runtime when it
 is present. TypeSafe SDK 0.6.0 has a confirmed cancellation crash on supported
@@ -65,7 +104,8 @@ changing your default Node version:
 
 ```bash
 brew install node@24
-brew install --cask microsoft-edge
+# Optional: needed only for the compiled browser mode and benchmark.
+brew install --cask google-chrome
 ```
 
 ```bash
@@ -93,15 +133,15 @@ List the workflow to obtain its exact digest, review the manifest, then pin that
   -w '<64-character-workflow-digest>'
 ```
 
-Run `jev_cua_doctor`, then `jev_cua_list_workflows`. Use a new shadow-only run key to inspect the static `shadow_plan`; shadow launches no browser and calls no TypeSafe service. If the plan is correct, use a distinct new key for the live attempt. Never mint another live key to replay an uncertain action.
+You may call `jev_cua_list_workflows` and inspect a compiled `shadow_plan` without Cua being ready: both are local and shadow launches no browser or TypeSafe service. Run `jev_cua_doctor` and require `ready` before `jev_cua_native_start` or any compiled `live` attempt. For native work, start only after the target app is already open, and continue only when exactly one plausible app and window match the user's intended target. For compiled work, if the request does not clearly identify a workflow and is safe to disclose to TypeSafe after best-effort redaction, call `jev_cua_route_workflow` with `acknowledge_typesafe_disclosure: true`; it can return a recommendation but never runs the result. Confirm the returned ID, version, digest, inputs, and approval against the local workflow list. Use a new shadow-only run key to inspect the complete static `shadow_plan`. Refuse live execution if any step is r3 or r4; otherwise, if the plan is correct, use a distinct new key for the live attempt. Never mint another live key to replay an uncertain action.
 
 ### Recovering a quarantined live run
 
-There is intentionally no MCP tool that clears the execution barrier. If `jev_cua_doctor` reports `live_execution_safety` as blocked, use this trusted-operator procedure from a trusted terminal:
+There is intentionally no MCP tool that clears the execution barrier or acknowledges an uncertain operation. If `jev_cua_doctor` reports `live_execution_safety`, `durable_runs`, or `native_operations` as blocked, a trusted human must personally use this procedure from an interactive trusted terminal. The human must reconcile the real state and type the acknowledgement; an agent must not automate either step. Start in the plugin root (the directory containing this README and `package.json`):
 
-1. Record the exact `runId`, `session`, and barrier state shown by the doctor, and inspect the run with the original run key using `jev_cua_get_run`. A crash after the barrier was cleared but before ledger completion can leave a ledger-only blocker; in that case derive the current session as `jev-cua-` plus the first 12 hexadecimal characters of the run ID with hyphens removed. The recovery CLI also accepts the earlier `8hex-3hex` session form.
-2. Run `cua-driver sessions --json`. If that exact session is still present, run `cua-driver revoke --session '<session>'`, then confirm it is absent with another `sessions --json` call.
-3. Reconcile the target site's real state. Browser cleanup does not prove that a server-side effect did or did not happen.
+1. Record the exact `runId`, `session`, barrier owner, and blocker class shown by the doctor. For a compiled workflow, inspect the record with its original run key using `jev_cua_get_run`. Native operation records deliberately contain no UI content or executable arguments and are not exposed through that workflow lookup. Compiled sessions use the reported `jev-cua-...` identity; native sessions use `jev-cua-native-` followed by 16 lowercase hexadecimal characters.
+2. Run `cua-driver sessions --json`. Recovery requires zero live Cua sessions globally, not merely the absence of the affected session. Revoke each live session by its exact identifier, then run `sessions --json` again and confirm the global list is empty.
+3. Personally reconcile the target app or site's real state. Ending every session does not prove that a UI or server-side effect did or did not happen.
 4. From an interactive trusted terminal, run the local recovery command with those exact identifiers:
 
    ```bash
@@ -110,9 +150,9 @@ There is intentionally no MCP tool that clears the execution barrier. If `jev_cu
      --session '<session>'
    ```
 
-5. Review the displayed identity and type the exact requested `RECONCILED <run-id>` phrase. This interactive phrase provides deliberate audit friction; it is not OS-backed proof of human presence, and malware running as the same user can automate it. The command refuses noninteractive input, any live Cua session, an untrusted Cua installation, and mismatched identities. It writes a private acknowledgement bound to the SHA-256 of that exact run record, then archives the owner-matched barrier when one remains. It deliberately leaves the original HMAC-keyed run ledger in place, so a completed old key returns its prior result and an interrupted old key remains permanently reserved; neither can execute again.
+5. As the trusted human, review the displayed identity and personally type the exact requested `RECONCILED <run-id>` phrase. Do not delegate or automate this acknowledgement. This interactive phrase provides deliberate audit friction; it is not OS-backed proof of human presence, and malware running as the same user can automate it. The command refuses noninteractive input, any live Cua session anywhere on the machine, an untrusted Cua installation, and mismatched identities. For a compiled run it writes a private acknowledgement bound to the exact run record. For a native run it marks matching active native-operation records reconciled without making them replayable. It then archives the owner-matched execution barrier when one remains.
 
-6. Run `jev_cua_doctor` again. Resume live work only when both the barrier and durable-run scan report unblocked. The archived barrier, acknowledgement, and original ledger form the retained audit trail.
+6. Run `jev_cua_doctor` again. Resume live work only when the execution barrier, durable-run scan, and native-operation scan all report unblocked. The archived barrier, reconciliation acknowledgement, and permanently reserved original ledger entries form the retained audit trail.
 
 The checked-in reference workflow is intentionally disabled. The bundled entrypoint is `mcp/server.cjs`.
 
@@ -157,12 +197,12 @@ The primary latency is monotonic elapsed time around `controller.run()`. Keychai
 
 Reports and content-free traces are written under ignored `benchmark-results/` directories with modes `0700` and `0600`. One exclusive batch lease prevents two schedules from interleaving. A dirty/unavailable source tree or mismatched installed TypeSafe SDK stops before a browser trial; the source commit and worktree are checked again after the batch. Every terminal stop marks measurements invalid and publishes no statistical summary. An interrupted batch remains marked `running`; the runner refuses to start another batch until its durable ledger is inspected. Do not use the keyboard or browser during a batch: the desktop lease excludes other compliant controllers, not a human or a process that invokes Cua directly.
 
-The report records the installed Microsoft Edge version, but Cua 0.28.2 does not identify the launched browser executable in its `browser_prepare` receipt. Treat that field as environment inventory, not proof that a particular trial used Edge.
+The report records installed Chrome and Edge versions and executable digests, but Cua 0.28.2 does not identify the launched browser executable in its `browser_prepare` receipt. Treat those fields as environment inventory, not proof that a particular trial used either browser.
 
-At each decision, the compiled controller exposes only the next executable reviewed step plus three stop routes. The benchmark measures Jev's marginal latency, token cost, and veto/reobserve behavior inside that controller; it cannot demonstrate better planning, general computer-use reasoning, or a “1000x” improvement. Thirty measured trials per arm are exploratory: even 30/30 verified gives only about an 88.6% Wilson lower bound, and its p95 estimate is unstable.
+At each decision, the compiled controller exposes only the next executable reviewed step plus three stop routes. Production uses the deterministic arm. The Jev arm is retained as an experimental ablation that measures the model's marginal latency, token cost, and veto/reobserve behavior inside that controller; it cannot demonstrate better planning, general computer-use reasoning, or a “1000x” improvement. Thirty measured trials per arm are exploratory: even 30/30 verified gives only about an 88.6% Wilson lower bound, and its p95 estimate is unstable.
 
 ## Why Cua + Jev
 
-Cua’s semantic snapshots and exact refs address UI grounding; they do not supply workflow authorization, durable idempotency, or postcondition semantics. The v0.1 compiler exposes only the exact next executable workflow step plus the three stop/reobserve routes, so Jev currently acts as a probabilistic veto—not as a general planner. That extra call may reduce rather than improve speed; benchmark it against a deterministic bypass. The controller supplies the state machine and fails closed when the page, receipt schema, decision, or evidence falls outside its contract.
+Cua’s semantic snapshots and exact refs address UI grounding; they do not supply workflow authorization, durable idempotency, or postcondition semantics. The compiler and controller supply that state machine and fail closed when the page, receipt schema, decision, or evidence falls outside its contract. Asking Jev to select the sole already-proven next step added latency and false rejection without adding information, so exact execution is deterministic. Jev is reserved for the genuinely semantic problem of mapping an ambiguous request across multiple reviewed workflows, and even there it only recommends an opaque local choice.
 
 Relevant upstream material: [Cua Driver installation](https://cua.ai/docs/how-to-guides/driver/install), [agent connection](https://cua.ai/docs/how-to-guides/driver/connect-your-agent), and [semantic snapshots](https://cua.ai/docs/reference/cua-driver/browser-semantic-snapshots).

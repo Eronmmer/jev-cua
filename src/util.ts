@@ -37,12 +37,16 @@ export function asRecord(
   return value as Record<string, unknown>;
 }
 
-export function truncateUntrusted(value: string, maximum: number): string {
-  const normalized = value
+export function normalizeUntrusted(value: string): string {
+  return value
     .normalize("NFKC")
     .replace(/[\p{Cc}\p{Cf}]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+export function truncateUntrusted(value: string, maximum: number): string {
+  const normalized = normalizeUntrusted(value);
   return normalized.length <= maximum
     ? normalized
     : `${normalized.slice(0, maximum - 1)}…`;

@@ -22,11 +22,35 @@ import type {
 const requiredTools = [
   "health_report",
   "check_permissions",
+  "get_accessibility_tree",
+  "list_apps",
+  "list_windows",
+  "get_window_state",
+  "verify_state",
+  "launch_app",
+  "start_session",
+  "click",
+  "type_text",
+  "set_value",
+  "press_key",
+  "scroll",
+  "invoke_menu",
   "browser_prepare",
   "browser_navigate",
   "get_browser_state",
-  "list_windows",
   "end_session",
+];
+
+const actionTools = [
+  "click",
+  "type_text",
+  "set_value",
+  "press_key",
+  "scroll",
+  "invoke_menu",
+  "browser_click",
+  "browser_type",
+  "browser_pointer",
 ];
 
 function actionTool(name: string): DriverToolDescriptor {
@@ -66,7 +90,7 @@ function actionTool(name: string): DriverToolDescriptor {
 function reviewedTools(): DriverToolDescriptor[] {
   return [
     ...requiredTools
-      .filter((name) => name !== "end_session")
+      .filter((name) => name !== "end_session" && !actionTools.includes(name))
       .map((name) => ({ name })),
     {
       name: "end_session",
@@ -82,9 +106,7 @@ function reviewedTools(): DriverToolDescriptor[] {
         ],
       },
     },
-    actionTool("browser_click"),
-    actionTool("browser_type"),
-    actionTool("browser_pointer"),
+    ...actionTools.map(actionTool),
   ];
 }
 

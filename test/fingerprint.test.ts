@@ -20,7 +20,7 @@ const baseConfig: RuntimeConfig = {
   },
 };
 
-test("durable policy fingerprints bind workflow bytes, model, gates, and policy semantics", () => {
+test("Jev policy fingerprints bind workflow bytes, model, gates, and policy semantics", () => {
   const first = workflowPolicyFingerprint("a".repeat(64), baseConfig);
   assert.match(first, /^[a-f0-9]{64}$/u);
   assert.equal(first, workflowPolicyFingerprint("a".repeat(64), baseConfig));
@@ -39,12 +39,49 @@ test("durable policy fingerprints bind workflow bytes, model, gates, and policy 
       model: "jev-other",
     }),
   );
+});
+
+test("deterministic policy fingerprints ignore only the unrelated Jev model", () => {
+  const identity = "deterministic-closed-set-v1";
+  const first = workflowPolicyFingerprint("a".repeat(64), baseConfig, identity);
+
+  assert.notEqual(workflowPolicyFingerprint("a".repeat(64), baseConfig), first);
+  assert.equal(
+    first,
+    workflowPolicyFingerprint(
+      "a".repeat(64),
+      {
+        ...baseConfig,
+        model: "jev-other",
+      },
+      identity,
+    ),
+  );
   assert.notEqual(
     first,
     workflowPolicyFingerprint(
       "a".repeat(64),
-      baseConfig,
-      "deterministic-closed-set-v1",
+      {
+        ...baseConfig,
+        thresholds: { ...baseConfig.thresholds, minimumConfidence: 0.81 },
+      },
+      identity,
     ),
+  );
+  assert.notEqual(
+    first,
+    workflowPolicyFingerprint(
+      "a".repeat(64),
+      { ...baseConfig, maxCandidates: baseConfig.maxCandidates + 1 },
+      identity,
+    ),
+  );
+  assert.notEqual(
+    first,
+    workflowPolicyFingerprint("b".repeat(64), baseConfig, identity),
+  );
+  assert.notEqual(
+    first,
+    workflowPolicyFingerprint("a".repeat(64), baseConfig, "deterministic-v2"),
   );
 });

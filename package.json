@@ -2,7 +2,7 @@
   "name": "jev-cua",
   "version": "0.1.0",
   "private": true,
-  "description": "Production local Cua + TypeSafe Jev fast-path runtime for Codex and Waku",
+  "description": "Guarded app-agnostic Mac Accessibility control plus deterministic Cua fast paths for Codex and Waku",
   "type": "module",
   "engines": {
     "node": ">=24.21.0"
@@ -21,7 +21,7 @@
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "validate:plugin": "python3 /Users/erons/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .",
-    "validate:skill": "python3 /Users/erons/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/jev-cua-fastpath"
+    "validate:skill": "python3 /Users/erons/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/jev-cua-computer-use"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

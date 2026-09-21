@@ -585,15 +585,31 @@ test("git reproducibility checks distinguish clean, dirty, and changed source", 
   );
 });
 
-test("runtime artifact reproducibility requires the pinned installed SDK and lock digest", () => {
+test("runtime artifact reproducibility accepts Chrome first or Edge as a fallback", () => {
+  const base = {
+    node: "24.21.0",
+    typeSafeSdkVersion: "0.6.0",
+    typeSafeSdkEntrypointSha256: "d".repeat(64),
+    packageLockSha256: "a".repeat(64),
+    cuaExecutableSha256: "b".repeat(64),
+  } as const;
   assert.deepEqual(
     runtimeArtifactReproducibilityReasons({
-      node: "24.21.0",
-      typeSafeSdkVersion: "0.6.0",
-      typeSafeSdkEntrypointSha256: "d".repeat(64),
-      packageLockSha256: "a".repeat(64),
-      cuaExecutableSha256: "b".repeat(64),
-      edgeExecutableSha256: "c".repeat(64),
+      ...base,
+      installedChromeVersion: "Google Chrome 140.0.0.0",
+      chromeExecutableSha256: "c".repeat(64),
+      installedEdgeVersion: null,
+      edgeExecutableSha256: null,
+    }),
+    [],
+  );
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons({
+      ...base,
+      installedChromeVersion: null,
+      chromeExecutableSha256: null,
+      installedEdgeVersion: "Microsoft Edge 140.0.0.0",
+      edgeExecutableSha256: "e".repeat(64),
     }),
     [],
   );
@@ -604,6 +620,9 @@ test("runtime artifact reproducibility requires the pinned installed SDK and loc
       typeSafeSdkEntrypointSha256: null,
       packageLockSha256: null,
       cuaExecutableSha256: null,
+      installedChromeVersion: null,
+      chromeExecutableSha256: null,
+      installedEdgeVersion: null,
       edgeExecutableSha256: null,
     }),
     [
@@ -611,30 +630,93 @@ test("runtime artifact reproducibility requires the pinned installed SDK and loc
       "typesafe_sdk_entrypoint_digest_unavailable",
       "package_lock_digest_unavailable",
       "cua_executable_digest_unavailable",
-      "edge_executable_digest_unavailable",
+      "trusted_chromium_executable_digest_unavailable",
     ],
   );
+});
 
+test("runtime artifact postcheck binds every browser present at precheck", () => {
   const initial = {
     node: "24.21.0",
     typeSafeSdkVersion: "0.6.0",
     typeSafeSdkEntrypointSha256: "a".repeat(64),
     packageLockSha256: "b".repeat(64),
     cuaExecutableSha256: "c".repeat(64),
-    edgeExecutableSha256: "d".repeat(64),
+    installedChromeVersion: "Google Chrome 140.0.0.0",
+    chromeExecutableSha256: "d".repeat(64),
+    installedEdgeVersion: "Microsoft Edge 140.0.0.0",
+    edgeExecutableSha256: "e".repeat(64),
   } as const;
   assert.deepEqual(
     runtimeArtifactReproducibilityReasons(initial, {
       ...initial,
       node: "25.0.0",
-      typeSafeSdkEntrypointSha256: "e".repeat(64),
+      typeSafeSdkEntrypointSha256: "f".repeat(64),
       packageLockSha256: null,
+      chromeExecutableSha256: null,
+      edgeExecutableSha256: "0".repeat(64),
     }),
     [
       "node_runtime_changed_during_batch",
       "typesafe_sdk_entrypoint_changed_during_batch",
       "package_lock_postcheck_digest_unavailable",
+      "chrome_executable_disappeared_during_batch",
+      "edge_executable_changed_during_batch",
     ],
+  );
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons(initial, {
+      ...initial,
+      chromeExecutableSha256: "0".repeat(64),
+      edgeExecutableSha256: null,
+    }),
+    [
+      "chrome_executable_changed_during_batch",
+      "edge_executable_disappeared_during_batch",
+    ],
+  );
+
+  const chromeOnly = {
+    ...initial,
+    installedEdgeVersion: null,
+    edgeExecutableSha256: null,
+  } as const;
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons(chromeOnly, chromeOnly),
+    [],
+  );
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons(chromeOnly, {
+      ...chromeOnly,
+      installedEdgeVersion: "Microsoft Edge 140.0.0.0",
+      edgeExecutableSha256: "f".repeat(64),
+    }),
+    ["edge_executable_added_during_batch", "edge_version_changed_during_batch"],
+  );
+
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons(initial, {
+      ...initial,
+      installedChromeVersion: "Google Chrome 141.0.0.0",
+      installedEdgeVersion: "Microsoft Edge 141.0.0.0",
+    }),
+    [
+      "chrome_version_changed_during_batch",
+      "edge_version_changed_during_batch",
+    ],
+  );
+
+  const edgeOnly = {
+    ...initial,
+    installedChromeVersion: null,
+    chromeExecutableSha256: null,
+  } as const;
+  assert.deepEqual(
+    runtimeArtifactReproducibilityReasons(edgeOnly, {
+      ...edgeOnly,
+      edgeExecutableSha256: null,
+    }),
+    ["edge_executable_disappeared_during_batch"],
   );
 });
 

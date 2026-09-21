@@ -1,7 +1,7 @@
 {
   "name": "jev-cua",
-  "version": "0.1.0+codex.20260920055237",
-  "description": "Run bounded computer-use workflows through a local Cua Driver and TypeSafe Jev fast path.",
+  "version": "0.1.0+codex.20260921004427",
+  "description": "Guarded Mac Accessibility control with deterministic fast paths and optional TypeSafe Jev routing.",
   "author": {
     "name": "Eronmonsele Aigbiluese",
     "url": "https://github.com/Eronmmer"
@@ -11,17 +11,19 @@
   "keywords": ["computer-use", "cua", "jev", "typesafe", "mcp"],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Jev Cua Fastpath",
-    "shortDescription": "Fast, verified bounded computer-use workflows.",
-    "longDescription": "Runs structured UI subgoals in a local observe-decide-act-verify loop. Cua Driver owns desktop interaction, Jev selects only allowlisted action IDs, and uncertain or consequential actions return to Codex or the user.",
+    "displayName": "Jev Cua Accessibility",
+    "shortDescription": "Guarded Mac Accessibility with verified fast paths.",
+    "longDescription": "Provides app-agnostic guarded Accessibility control for already-running Mac apps; it is not full computer use. Native v1 exposes AXPress, bounded vertical scroll, and approval-gated Accessibility set-value, while excluding screenshots, coordinates, synthetic typing, key/menu invocation, and app launch/quit. Secret detection is best-effort, so callers must never supply secrets and should assume tool arguments and approval forms may be logged. Reviewed repetitive browser workflows add digest pinning and deterministic execution. Optional Jev routing recommends among installed workflows without executing them.",
     "developerName": "Eronmonsele Aigbiluese",
     "category": "Productivity",
     "capabilities": ["Computer Use", "Interactive", "Write"],
     "websiteURL": "https://github.com/Eronmmer/jev-cua",
     "defaultPrompt": [
-      "Run this bounded browser workflow with Jev Cua.",
-      "Check whether Jev Cua is ready on this Mac.",
-      "Use the fast path and stop before consequential actions."
+      "Use Jev Cua to operate this already-running Mac app safely.",
+      "Inspect this app and show me its available bound actions and approval requirements.",
+      "Run this reviewed browser workflow through the compiled fast path.",
+      "Recommend the installed workflow that matches this request.",
+      "Check whether Jev Cua is ready on this Mac."
     ]
   },
   "mcpServers": "./.mcp.json"

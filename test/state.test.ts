@@ -67,6 +67,23 @@ test("desktop lease is exclusive, reports its owner, and releases idempotently",
   await releaseSecond();
 });
 
+test("desktop lease release retries after a transient owned-lock failure", async (t) => {
+  if (process.platform === "win32") return;
+  const directory = await stateDirectory(t);
+  const lease = new DesktopLease(directory);
+  const release = await lease.acquire("retry-release");
+  const lockPath = join(directory, "desktop.lock");
+
+  await chmod(lockPath, 0o000);
+  await assert.rejects(release());
+  assert.equal((await lease.status()).busy, true);
+
+  await chmod(lockPath, 0o600);
+  await release();
+  await release();
+  assert.deepEqual(await lease.status(), { busy: false });
+});
+
 test("live execution barrier is durable, owner-bound, and fail-closed", async (t) => {
   const directory = await stateDirectory(t);
   const barrier = new LiveExecutionBarrier(directory);

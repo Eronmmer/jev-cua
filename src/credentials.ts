@@ -14,6 +14,56 @@ export type TypeSafeCredential = Readonly<{
   apiKey?: string;
 }>;
 
+export type TypeSafeCredentialStatus = Readonly<{
+  source: CredentialSource;
+  present: boolean;
+}>;
+
+async function keychainItemExists(): Promise<boolean> {
+  try {
+    // Deliberately omit `-w`: readiness needs item presence, not the secret.
+    // Reading metadata avoids a Keychain secret-access prompt and keeps the
+    // optional credential out of deterministic-only process memory.
+    await execFile(
+      "/usr/bin/security",
+      [
+        "find-generic-password",
+        "-s",
+        TYPESAFE_KEYCHAIN_SERVICE,
+        "-a",
+        TYPESAFE_KEYCHAIN_ACCOUNT,
+      ],
+      {
+        timeout: 1_500,
+        maxBuffer: 16 * 1024,
+        env: trustedHelperEnvironment(process.env, { userDirectories: true }),
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function probeTypeSafeCredential(
+  env: NodeJS.ProcessEnv = process.env,
+  dependencies: Readonly<{
+    keychainItemExists: () => Promise<boolean>;
+  }> = { keychainItemExists },
+): Promise<TypeSafeCredentialStatus> {
+  if (env.TYPESAFE_API_KEY?.trim()) {
+    return Object.freeze({ source: "environment", present: true });
+  }
+  if (process.platform !== "darwin") {
+    return Object.freeze({ source: "missing", present: false });
+  }
+  const present = await dependencies.keychainItemExists();
+  return Object.freeze({
+    source: present ? "keychain" : "missing",
+    present,
+  });
+}
+
 export async function loadTypeSafeCredential(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<TypeSafeCredential> {

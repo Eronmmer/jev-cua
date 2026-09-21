@@ -12,6 +12,7 @@ import {
 } from "../cua/compatibility.js";
 import { trustedHelperEnvironment } from "../runtime/child-environment.js";
 import { assertSupportedNodeRuntime } from "../runtime/node-version.js";
+import { NativeOperationStore } from "../native/operation-store.js";
 import { DesktopLease, LiveExecutionBarrier, RunStore } from "../state.js";
 
 const execFile = promisify(execFileCallback);
@@ -45,7 +46,9 @@ export function parseRecoveryArguments(
       runId,
     ) ||
     !session ||
-    !/^jev-cua-(?:[a-f0-9]{12}|[a-f0-9]{8}-[a-f0-9]{3})$/u.test(session)
+    !/^jev-cua-(?:native-[a-f0-9]{16}|[a-f0-9]{12}|[a-f0-9]{8}-[a-f0-9]{3})$/u.test(
+      session,
+    )
   ) {
     throw new Error(
       "the exact doctor-reported run ID and session are required",
@@ -108,12 +111,29 @@ async function main(): Promise<void> {
   );
   const barrier = new LiveExecutionBarrier(stateDirectory);
   const runs = new RunStore(stateDirectory);
+  const nativeOperations = new NativeOperationStore(stateDirectory);
   const lease = new DesktopLease(stateDirectory);
   const release = await lease.acquire(`recovery-${input.runId}`);
   try {
-    const status = await barrier.status();
-    const durableStatus = await runs.liveExecutionStatus();
-    if (status.blocked) {
+    const nativeRecovery = input.session.startsWith("jev-cua-native-");
+    const [status, durableStatus] = await Promise.all([
+      barrier.status(),
+      runs.liveExecutionStatus(),
+    ]);
+    if (nativeRecovery) {
+      // Native operation records deliberately contain no session identifier.
+      // The exact live barrier is therefore the authority that binds the
+      // supplied run ID and Cua session before any record can be acknowledged.
+      if (
+        !status.blocked ||
+        status.runId !== input.runId ||
+        status.session !== input.session
+      ) {
+        throw new Error(
+          "the supplied identity does not own an active native execution barrier",
+        );
+      }
+    } else if (status.blocked) {
       if (status.runId !== input.runId || status.session !== input.session) {
         throw new Error(
           "the supplied identity does not own the active execution barrier",
@@ -144,7 +164,7 @@ async function main(): Promise<void> {
         `Run: ${input.runId}`,
         `Session: ${input.session}`,
         `Barrier state: ${status.blocked ? (status.state ?? "malformed") : "ledger_only"}`,
-        "This command cannot verify the target site's remote state.",
+        "This command cannot verify the target application's real external state.",
         "Continue only after you have reconciled the real external outcome.",
       ].join("\n") + "\n",
     );
@@ -167,17 +187,30 @@ async function main(): Promise<void> {
     // The acknowledgement is committed first. A crash before archiving the
     // barrier remains fail-closed; the original run ledger is never removed,
     // so the old idempotency key can never execute again.
-    await runs.acknowledgeReconciliation(input.runId, {
-      barrierOwnerConfirmed: status.blocked,
-    });
+    if (nativeRecovery) {
+      // A cleanup-only native failure legitimately has no active operation
+      // record, so zero acknowledgements is allowed when the exact barrier was
+      // established above. Any active records for this run are made permanently
+      // non-executable; their old operation keys continue to resolve as active.
+      await nativeOperations.acknowledgeReconciliation(input.runId);
+    } else {
+      await runs.acknowledgeReconciliation(input.runId, {
+        barrierOwnerConfirmed: status.blocked,
+      });
+    }
     const archivePath = status.blocked
       ? await barrier.archiveResolved(input.runId, input.session)
       : null;
-    const [barrierAfter, runsAfter] = await Promise.all([
+    const [barrierAfter, runsAfter, nativeOperationsAfter] = await Promise.all([
       barrier.status(),
       runs.liveExecutionStatus(),
+      nativeOperations.executionStatus(),
     ]);
-    if (barrierAfter.blocked || runsAfter.blocked) {
+    if (
+      barrierAfter.blocked ||
+      runsAfter.blocked ||
+      nativeOperationsAfter.blocked
+    ) {
       throw new Error(
         "reconciliation was recorded, but another safety blocker remains",
       );

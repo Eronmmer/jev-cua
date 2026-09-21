@@ -64,10 +64,49 @@ const MUTATING_TOOLS = new Set([
   "browser_download",
   "browser_prepare",
   "click",
+  "double_click",
+  "right_click",
   "type_text",
   "set_value",
   "press_key",
+  "hotkey",
+  "scroll",
+  "drag",
+  "invoke_menu",
+  "launch_app",
+  "bring_to_front",
+  "set_window_frame",
+  "kill_app",
+  "clipboard_write",
+  "move_cursor",
+  "set_agent_cursor_enabled",
+  "set_agent_cursor_motion",
+  "set_agent_cursor_theme",
+  "set_config",
+  "start_recording",
+  "stop_recording",
+  "replay_trajectory",
+  "install_ffmpeg",
+  "escalate_session",
+  "page",
 ]);
+
+const NATIVE_COMMON_ACTION_TOOLS = new Set([
+  "click",
+  "double_click",
+  "right_click",
+  "type_text",
+  "set_value",
+  "press_key",
+  "hotkey",
+  "scroll",
+  "drag",
+  "invoke_menu",
+]);
+
+export function driverToolMayMutate(tool: string): boolean {
+  return MUTATING_TOOLS.has(tool);
+}
 
 // Cua 0.28.2 reports permission-gate failures as an MCP error whose structured
 // code is only `tool_invocation_failed`; retain only this reviewed, non-sensitive
@@ -436,6 +475,55 @@ export function validateStructuredReceipt(
         true,
         `${tool} receipt did not match the requested semantic ref`,
       );
+    }
+    return;
+  }
+  if (NATIVE_COMMON_ACTION_TOOLS.has(tool)) {
+    const canonicalEffects = new Set(["confirmed", "unverifiable"]);
+    const canonicalRoutes = new Set([
+      "accessibility",
+      "synthetic_events",
+      "global_input",
+      "system_api",
+      "dom",
+      "trusted_input",
+    ]);
+    if (
+      !canonicalEffects.has(String(data.effect)) ||
+      !canonicalRoutes.has(String(data.route))
+    ) {
+      throw new DriverToolError(
+        tool,
+        true,
+        `${tool} returned no supported dispatch receipt`,
+      );
+    }
+    if (
+      data.effect === "confirmed" &&
+      (!Array.isArray(data.evidence) || data.evidence.length === 0)
+    ) {
+      throw new DriverToolError(
+        tool,
+        true,
+        `${tool} returned an unsupported confirmed receipt`,
+      );
+    }
+    if (arguments_.delivery_mode === "background") {
+      const delivery =
+        data.delivery &&
+        typeof data.delivery === "object" &&
+        !Array.isArray(data.delivery)
+          ? (data.delivery as Record<string, unknown>)
+          : undefined;
+      const expectedDeliveryMode =
+        data.route === "synthetic_events" ? "background" : "not_applicable";
+      if (!delivery || delivery.mode !== expectedDeliveryMode) {
+        throw new DriverToolError(
+          tool,
+          true,
+          `${tool} receipt did not preserve background delivery`,
+        );
+      }
     }
     return;
   }

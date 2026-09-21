@@ -65,6 +65,10 @@ const REPOSITORY_ROOT = dirname(
   dirname(dirname(fileURLToPath(import.meta.url))),
 );
 const EXPECTED_TYPESAFE_SDK_VERSION = "0.6.0";
+const CHROME_EXECUTABLE =
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const EDGE_EXECUTABLE =
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge";
 export const BENCHMARK_WORKFLOW_CONTRACT = Object.freeze({
   id: "catalog-search-benchmark",
   version: 1,
@@ -86,6 +90,9 @@ export type RuntimeArtifactSnapshot = Readonly<{
   typeSafeSdkEntrypointSha256: string | null;
   packageLockSha256: string | null;
   cuaExecutableSha256: string | null;
+  installedChromeVersion: string | null;
+  chromeExecutableSha256: string | null;
+  installedEdgeVersion: string | null;
   edgeExecutableSha256: string | null;
 }>;
 
@@ -174,6 +181,8 @@ export type BenchmarkReport = Readonly<{
     release: string;
     architecture: string;
     macosVersion: string | null;
+    installedChromeVersion: string | null;
+    chromeExecutableSha256: string | null;
     installedEdgeVersion: string | null;
     edgeExecutableSha256: string | null;
     cuaVersion: string;
@@ -1226,23 +1235,17 @@ async function collectEnvironment(
   cuaTools: number,
   credentialSource: "environment" | "keychain" | "missing",
 ): Promise<BenchmarkReport["environment"]> {
-  const [macosVersion, installedEdgeVersion, gitState, runtimeArtifacts] =
-    await Promise.all([
-      safeExec("/usr/bin/sw_vers", ["-productVersion"]),
-      safeExec(
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        ["--version"],
-      ),
-      collectGitState(),
-      collectRuntimeArtifactSnapshot(cuaBinary),
-    ]);
+  const [macosVersion, gitState, runtimeArtifacts] = await Promise.all([
+    safeExec("/usr/bin/sw_vers", ["-productVersion"]),
+    collectGitState(),
+    collectRuntimeArtifactSnapshot(cuaBinary),
+  ]);
   return Object.freeze({
     ...runtimeArtifacts,
     platform: platform(),
     release: release(),
     architecture: arch(),
     macosVersion,
-    installedEdgeVersion,
     cuaVersion,
     cuaTools,
     ...gitState,
@@ -1268,6 +1271,9 @@ async function collectRuntimeArtifactSnapshot(
     typeSafeSdkEntrypointSha256,
     packageLockSha256,
     cuaExecutableSha256,
+    installedChromeVersion,
+    chromeExecutableSha256,
+    installedEdgeVersion,
     edgeExecutableSha256,
   ] = await Promise.all([
     collectInstalledTypeSafeSdkVersion(),
@@ -1276,9 +1282,10 @@ async function collectRuntimeArtifactSnapshot(
       : Promise.resolve(null),
     sha256File(join(REPOSITORY_ROOT, "package-lock.json")),
     sha256File(cuaBinary),
-    sha256File(
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    ),
+    safeExec(CHROME_EXECUTABLE, ["--version"]),
+    sha256File(CHROME_EXECUTABLE),
+    safeExec(EDGE_EXECUTABLE, ["--version"]),
+    sha256File(EDGE_EXECUTABLE),
   ]);
   return Object.freeze({
     node: process.versions.node,
@@ -1286,6 +1293,9 @@ async function collectRuntimeArtifactSnapshot(
     typeSafeSdkEntrypointSha256,
     packageLockSha256,
     cuaExecutableSha256,
+    installedChromeVersion,
+    chromeExecutableSha256,
+    installedEdgeVersion,
     edgeExecutableSha256,
   });
 }
@@ -1333,8 +1343,11 @@ export function runtimeArtifactReproducibilityReasons(
   if (environment.cuaExecutableSha256 === null) {
     reasons.push("cua_executable_digest_unavailable");
   }
-  if (environment.edgeExecutableSha256 === null) {
-    reasons.push("edge_executable_digest_unavailable");
+  if (
+    environment.chromeExecutableSha256 === null &&
+    environment.edgeExecutableSha256 === null
+  ) {
+    reasons.push("trusted_chromium_executable_digest_unavailable");
   }
   if (postcheck) {
     if (postcheck.node !== environment.node) {
@@ -1369,15 +1382,59 @@ export function runtimeArtifactReproducibilityReasons(
       "cua_executable_postcheck_digest_unavailable",
       "cua_executable_changed_during_batch",
     );
-    compareRuntimeDigest(
+    compareInstalledBrowserDigest(
       reasons,
+      "chrome",
+      environment.chromeExecutableSha256,
+      postcheck.chromeExecutableSha256,
+    );
+    compareInstalledBrowserVersion(
+      reasons,
+      "chrome",
+      environment.installedChromeVersion,
+      postcheck.installedChromeVersion,
+    );
+    compareInstalledBrowserDigest(
+      reasons,
+      "edge",
       environment.edgeExecutableSha256,
       postcheck.edgeExecutableSha256,
-      "edge_executable_postcheck_digest_unavailable",
-      "edge_executable_changed_during_batch",
+    );
+    compareInstalledBrowserVersion(
+      reasons,
+      "edge",
+      environment.installedEdgeVersion,
+      postcheck.installedEdgeVersion,
     );
   }
   return Object.freeze([...new Set(reasons)]);
+}
+
+function compareInstalledBrowserDigest(
+  reasons: string[],
+  browser: "chrome" | "edge",
+  initial: string | null,
+  postcheck: string | null,
+): void {
+  // Any inventory transition can alter Cua's browser choice or fallback path.
+  if (initial === null && postcheck !== null) {
+    reasons.push(`${browser}_executable_added_during_batch`);
+  } else if (initial !== null && postcheck === null) {
+    reasons.push(`${browser}_executable_disappeared_during_batch`);
+  } else if (initial !== null && postcheck !== null && postcheck !== initial) {
+    reasons.push(`${browser}_executable_changed_during_batch`);
+  }
+}
+
+function compareInstalledBrowserVersion(
+  reasons: string[],
+  browser: "chrome" | "edge",
+  initial: string | null,
+  postcheck: string | null,
+): void {
+  if (initial !== postcheck) {
+    reasons.push(`${browser}_version_changed_during_batch`);
+  }
 }
 
 function compareRuntimeDigest(

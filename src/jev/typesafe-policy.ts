@@ -10,7 +10,11 @@ import {
 
 import type { RuntimeConfig } from "../config.js";
 import type { CandidateDecision, DecisionPolicy } from "../types.js";
-import { redactProviderText, truncateUntrusted } from "../util.js";
+import {
+  normalizeUntrusted,
+  redactProviderText,
+  truncateUntrusted,
+} from "../util.js";
 
 type TypeSafeClientLike = Pick<TypeSafeClient, "systemOne">;
 
@@ -80,7 +84,10 @@ export class TypeSafeDecisionPolicy implements DecisionPolicy {
     const projectedCandidates = input.candidates.map((candidate) => ({
       id: candidate.id,
       description: redactProviderText(
-        truncateUntrusted(candidate.description, 500),
+        truncateUntrusted(
+          redactProviderText(normalizeUntrusted(candidate.description)),
+          500,
+        ),
       ),
       risk: candidate.risk,
     }));
@@ -116,7 +123,10 @@ export class TypeSafeDecisionPolicy implements DecisionPolicy {
       );
     }
 
-    const providerGoal = redactProviderText(truncateUntrusted(input.goal, 320));
+    const providerGoal = truncateUntrusted(
+      redactProviderText(normalizeUntrusted(input.goal)),
+      320,
+    );
     const started = performance.now();
     const response = await this.client.systemOne(
       {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jev Cua Computer Use"
+  short_description: "Guarded Mac control and browser fast paths"
+  default_prompt: "Use $jev-cua-computer-use to operate this already-running Mac app safely and verify each change."

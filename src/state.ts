@@ -212,7 +212,6 @@ export class DesktopLease {
         let released = false;
         return async () => {
           if (released) return;
-          released = true;
           try {
             const current = await readPrivateJson<Partial<LockRecord>>(
               this.lockPath,
@@ -221,8 +220,16 @@ export class DesktopLease {
             if (current.pid === record.pid && current.runId === record.runId) {
               await unlink(this.lockPath);
             }
+            released = true;
           } catch (error: unknown) {
-            if (!isErrno(error, "ENOENT")) throw error;
+            if (isErrno(error, "ENOENT")) {
+              released = true;
+              return;
+            }
+            // Preserve retryability when reading or removing the exact owned
+            // lock fails. Marking this released before success can strand a
+            // live-process lock forever inside a long-running MCP server.
+            throw error;
           }
         };
       } catch (error: unknown) {
@@ -323,7 +330,7 @@ export class LiveExecutionBarrier {
     const status = await this.status();
     if (status.blocked) {
       throw new Error(
-        "live browser execution is blocked by an unresolved prior execution",
+        "live computer-use execution is blocked by an unresolved prior execution",
       );
     }
   }

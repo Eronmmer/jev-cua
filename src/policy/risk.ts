@@ -3,7 +3,8 @@ import type { Candidate, RiskClass } from "../types.js";
 const FORBIDDEN_PATTERNS = [
   /\b(delete|erase|destroy|remove account|close account)\b/iu,
   /\b(buy|purchase|pay|payment|checkout|transfer|withdraw|wire)\b/iu,
-  /\b(password|passcode|one[- ]?time code|2fa|mfa|security key|seed phrase|private key)\b/iu,
+  /\b(password|passcode|one[- ]?time code|otp|2fa|mfa|security key|seed phrase|private key|api key|access token|auth token|recovery code|secret)\b/iu,
+  /\b(force quit|quit|restart|shut down|shutdown|sleep|lock screen|log ?out)\b/iu,
   /\b(terms|legal agreement|sign contract|accept liability)\b/iu,
 ];
 

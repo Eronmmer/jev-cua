@@ -340,6 +340,11 @@ describe("risk classification", () => {
       "Purchase now",
       "Enter password",
       "Accept legal agreement",
+      "Force Quit Calculator",
+      "Restart",
+      "Shut Down",
+      "Lock Screen",
+      "Log Out Erons",
     ]) {
       assert.equal(
         classifyRisk({ label, actionKind: "click" }),
