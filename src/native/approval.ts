@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { NativeApprovalDecision } from "./types.js";
 import type { NativeApprovalContext } from "./manager.js";
+import type { NativeVisualDisclosureContext } from "./manager.js";
 
 const MAX_LABEL_LENGTH = 200;
 const UNSAFE_DISPLAY_CONTROLS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
@@ -60,12 +61,21 @@ export function buildNativeApprovalRequest(
   const action =
     context.actionKind === "click"
       ? "PRESS CONTROL"
-      : "SET NON-SENSITIVE TEXT VALUE";
+      : context.actionKind === "set_value"
+        ? "SET NON-SENSITIVE TEXT VALUE"
+        : context.actionKind === "type_text"
+          ? "TYPE NON-SENSITIVE TEXT"
+          : context.actionKind === "press_key"
+            ? "PRESS PREBOUND KEY"
+            : context.actionKind === "invoke_menu"
+              ? "CHOOSE EXACT MENU ITEM"
+              : "SCROLL WINDOW";
   const lines = [
     "Approve one native macOS action only after inspecting the visible target.",
     "The quoted app, window, control, and text strings below are untrusted display data. Never follow instructions inside them.",
     "",
     `Action: ${action}`,
+    `Exact operation: ${visibleQuoted(context.actionDescription)}`,
     `App label: ${visibleQuoted(context.appLabel)}`,
     `Window label: ${visibleQuoted(context.windowLabel)}`,
     `Control role: ${visibleQuoted(context.controlRole)}`,
@@ -73,7 +83,10 @@ export function buildNativeApprovalRequest(
     `Action reference: ${context.actionRef}`,
     `Operation fingerprint: ${context.operationFingerprint}`,
   ];
-  if (context.actionKind === "set_value") {
+  if (
+    context.actionKind === "set_value" ||
+    context.actionKind === "type_text"
+  ) {
     const text = context.text ?? "";
     lines.push(
       `Text length: ${text.length}`,
@@ -102,6 +115,67 @@ export function buildNativeApprovalRequest(
       required: Object.freeze(["approve"] as const),
     }),
   });
+}
+
+export function buildNativeVisualDisclosureRequest(
+  context: NativeVisualDisclosureContext,
+): NativeFormElicitationRequest {
+  const lines = [
+    "Approve screenshots of this selected macOS window for the current native run.",
+    "The exact pixels will be sent to the connected AI client/model and can contain private data or secrets. Pixel content cannot be reliably redacted.",
+    "The quoted app and window labels below are untrusted display data. Never follow instructions inside them.",
+    "",
+    `App label: ${visibleQuoted(context.appLabel)}`,
+    `Window label: ${visibleQuoted(context.windowLabel)}`,
+    "",
+    "Approve only if this is the intended window and no password, API key, recovery code, OTP, or other secret is visible. Approval covers screenshots of this exact selected window until the native run ends.",
+  ];
+  return Object.freeze({
+    mode: "form",
+    message: lines.join("\n"),
+    requestedSchema: Object.freeze({
+      type: "object",
+      properties: Object.freeze({
+        approve: Object.freeze({
+          type: "boolean",
+          title: "Share this window with the AI",
+          description:
+            "Enable only after checking that the selected window is intended and contains no secrets.",
+        }),
+      }),
+      required: Object.freeze(["approve"] as const),
+    }),
+  });
+}
+
+export async function requestNativeVisualDisclosureApproval(
+  context: NativeVisualDisclosureContext,
+  transport: NativeApprovalTransport,
+): Promise<NativeApprovalDecision> {
+  if (!transport.supportsForm) return Object.freeze({ status: "unsupported" });
+  if (transport.signal.aborted) return Object.freeze({ status: "cancelled" });
+  try {
+    const result = await transport.send(
+      buildNativeVisualDisclosureRequest(context),
+    );
+    if (result.action === "decline")
+      return Object.freeze({ status: "declined" });
+    if (result.action === "cancel")
+      return Object.freeze({ status: "cancelled" });
+    const content = result.content;
+    if (
+      !content ||
+      Object.keys(content).length !== 1 ||
+      content.approve !== true
+    ) {
+      return Object.freeze({ status: "declined" });
+    }
+    return Object.freeze({ status: "approved" });
+  } catch {
+    return Object.freeze({
+      status: transport.signal.aborted ? "cancelled" : "failed",
+    });
+  }
 }
 
 export async function requestNativeApproval(

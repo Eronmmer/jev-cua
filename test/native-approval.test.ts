@@ -3,10 +3,15 @@ import test from "node:test";
 
 import {
   buildNativeApprovalRequest,
+  buildNativeVisualDisclosureRequest,
   requestNativeApproval,
+  requestNativeVisualDisclosureApproval,
   type NativeFormElicitationResult,
 } from "../src/native/approval.js";
-import type { NativeApprovalContext } from "../src/native/manager.js";
+import type {
+  NativeApprovalContext,
+  NativeVisualDisclosureContext,
+} from "../src/native/manager.js";
 
 const CLICK_CONTEXT: NativeApprovalContext = Object.freeze({
   runRef: "nrun_public",
@@ -14,12 +19,51 @@ const CLICK_CONTEXT: NativeApprovalContext = Object.freeze({
   actionRef: "nact_public",
   operationFingerprint: "0123456789abcdef",
   actionKind: "click",
+  actionDescription: "Press this control",
   risk: "r3_consequential",
   appLabel: "Fixture App",
   windowLabel: "Fixture Window",
   controlRole: "AXButton",
   controlLabel: "Continue",
   untrustedUiData: true,
+});
+
+const VISUAL_CONTEXT: NativeVisualDisclosureContext = Object.freeze({
+  appLabel: "Fixture App",
+  windowLabel: "Fixture Window",
+  untrustedUiData: true,
+});
+
+test("visual disclosure requires informed form approval before any pixels are shared", async () => {
+  const request = buildNativeVisualDisclosureRequest(VISUAL_CONTEXT);
+  assert.match(request.message, /exact pixels will be sent/iu);
+  assert.match(request.message, /cannot be reliably redacted/iu);
+  assert.match(request.message, /no password.+secret is visible/isu);
+
+  let sends = 0;
+  const approved = await requestNativeVisualDisclosureApproval(VISUAL_CONTEXT, {
+    supportsForm: true,
+    signal: new AbortController().signal,
+    send: async (actual) => {
+      sends += 1;
+      assert.deepEqual(actual, request);
+      return { action: "accept", content: { approve: true } };
+    },
+  });
+  assert.deepEqual(approved, { status: "approved" });
+  assert.equal(sends, 1);
+
+  const unsupported = await requestNativeVisualDisclosureApproval(
+    VISUAL_CONTEXT,
+    {
+      supportsForm: false,
+      signal: new AbortController().signal,
+      send: async () => {
+        throw new Error("must not send");
+      },
+    },
+  );
+  assert.deepEqual(unsupported, { status: "unsupported" });
 });
 
 test("unsupported form elicitation fails closed without sending a request", async () => {

@@ -24,6 +24,19 @@ const VERIFICATION: NativeVerification = Object.freeze({
   stableSamples: 1,
 });
 
+const VISUAL_VERIFICATION: NativeVerification = Object.freeze({
+  expect: Object.freeze([
+    Object.freeze({
+      element: Object.freeze({
+        selector: Object.freeze({ labelContains: "Done" }),
+        exists: true,
+      }),
+    }),
+  ]),
+  timeoutMs: 0,
+  stableSamples: 2,
+});
+
 const WINDOW_CANDIDATE: NativeCandidate = Object.freeze({
   id: "core-window-candidate-private",
   targetKind: "window",
@@ -94,6 +107,19 @@ const FORBIDDEN_BUTTON: NativeCandidate = Object.freeze({
   untrustedText: true,
 });
 
+const VISUAL_CELL: NativeCandidate = Object.freeze({
+  id: "core-visual-cell-private",
+  targetKind: "visual_cell",
+  role: "VisualGridCell",
+  label: "D4",
+  valuePresent: false,
+  enabled: true,
+  selected: null,
+  actionKinds: Object.freeze(["click"] as const),
+  riskByAction: Object.freeze({ click: "r3_consequential" }),
+  untrustedText: true,
+});
+
 function defaultObservation(): NativeObservation {
   const candidates = Object.freeze([
     WINDOW_CANDIDATE,
@@ -122,6 +148,7 @@ class FakeCore implements NativeCoreFacade {
     verification: NativeVerification;
   }> = [];
   endCalls = 0;
+  launchCalls = 0;
   observation = defaultObservation();
   failListApps = false;
   failListWindows = false;
@@ -143,6 +170,7 @@ class FakeCore implements NativeCoreFacade {
         name: "Fixture App",
         running: true,
         active: false,
+        launchable: false,
         untrustedText: true as const,
       }),
       Object.freeze({
@@ -151,9 +179,33 @@ class FakeCore implements NativeCoreFacade {
         name: "Stopped Fixture",
         running: false,
         active: false,
+        launchable: true,
         untrustedText: true as const,
       }),
     ]);
+  }
+
+  async launchApp(input: Readonly<{ appRef: string; operationKey: string }>) {
+    assert.equal(input.appRef, "core-stopped-app-private");
+    assert.equal(input.operationKey, "launch-stopped-fixture");
+    this.launchCalls += 1;
+    return Object.freeze({
+      outcome: "verified" as const,
+      reasonCode: "app_launched" as const,
+      app: Object.freeze({
+        appRef: "core-stopped-app-private",
+        bundleId: "com.private.StoppedFixture",
+        name: "Stopped Fixture",
+        running: true,
+        active: false,
+        launchable: false,
+        untrustedText: true as const,
+      }),
+      mutationAttempted: true,
+      reconciliationRequired: false,
+      safeToRetry: false,
+      replayed: false,
+    });
   }
 
   async listWindows(input: Readonly<{ appRef: string }>) {
@@ -178,6 +230,52 @@ class FakeCore implements NativeCoreFacade {
     if (this.failObserve)
       throw new Error("private observe implementation detail");
     return this.observation;
+  }
+
+  async observeVisual(target: Readonly<{ windowRef: string }>) {
+    assert.equal(target.windowRef, "core-window-private");
+    return Object.freeze({
+      id: "core-visual-overview-private",
+      target,
+      width: 640,
+      height: 480,
+      image: Object.freeze({
+        type: "image" as const,
+        mimeType: "image/png" as const,
+        data: "aW1hZ2U=",
+      }),
+      regions: Object.freeze([
+        Object.freeze({ id: "core-region-private", label: "A1" }),
+      ]),
+    });
+  }
+
+  async refineVisual(
+    input: Readonly<{ overviewId: string; regionId: string }>,
+  ) {
+    assert.deepEqual(input, {
+      overviewId: "core-visual-overview-private",
+      regionId: "core-region-private",
+    });
+    const candidates = Object.freeze([VISUAL_CELL]);
+    return Object.freeze({
+      observation: Object.freeze({
+        id: "core-visual-detail-private",
+        target: Object.freeze({ windowRef: "core-window-private" }),
+        complete: true,
+        actionable: true,
+        candidateCount: 1,
+        candidates,
+        untrustedUiData: true as const,
+      }),
+      width: 276,
+      height: 288,
+      image: Object.freeze({
+        type: "image" as const,
+        mimeType: "image/jpeg" as const,
+        data: "aW1hZ2U=",
+      }),
+    });
   }
 
   async execute(
@@ -268,13 +366,46 @@ function actionWith(
   return action as NativePublicAction & Readonly<{ actionRef: string }>;
 }
 
+test("native manager exposes stopped apps and launches only their opaque ref", async () => {
+  const core = new FakeCore();
+  const manager = new NativeRunManager({ createCore: () => core });
+  const start = await manager.start();
+  const stopped = start.apps.find((app) => !app.running);
+  assert.ok(stopped);
+  const result = await manager.launchApp({
+    runRef: start.runRef,
+    appRef: stopped.appRef,
+    operationKey: "launch-stopped-fixture",
+  });
+  assert.equal(result.outcome, "verified");
+  assert.equal(result.app?.appRef, stopped.appRef);
+  assert.equal(result.app?.running, true);
+  assert.equal(core.launchCalls, 1);
+  const replay = await manager.launchApp({
+    runRef: start.runRef,
+    appRef: stopped.appRef,
+    operationKey: "launch-stopped-fixture",
+  });
+  assert.equal(replay.outcome, "verified");
+  assert.equal(core.launchCalls, 2);
+  assert.doesNotMatch(
+    JSON.stringify({ start, result, replay }),
+    /bundleId|com\.private|core-stopped/u,
+  );
+  await manager.shutdown();
+});
+
 test("native manager publishes only opaque capabilities and binds a fixed AXPress click", async () => {
   const core = new FakeCore();
   const manager = new NativeRunManager({ createCore: () => core });
   const { start, app, window } = await started(manager);
 
   assert.match(start.runRef, /^nrun_/u);
-  assert.equal(start.apps.length, 1);
+  assert.equal(start.apps.length, 2);
+  assert.equal(
+    start.apps.some((candidate) => !candidate.running),
+    true,
+  );
   assert.match(app.appRef, /^napp_/u);
   assert.match(window.windowRef, /^nwin_/u);
   await assert.rejects(
@@ -303,7 +434,7 @@ test("native manager publishes only opaque capabilities and binds a fixed AXPres
   assert.ok(windowCandidate);
   assert.equal(
     windowCandidate.actions.some((action) => action.kind === "press_key"),
-    false,
+    true,
   );
   assert.equal(
     windowCandidate.actions.filter(
@@ -312,7 +443,9 @@ test("native manager publishes only opaque capabilities and binds a fixed AXPres
     2,
   );
   assert.equal(
-    windowCandidate.actions.some((action) => action.kind === "invoke_menu"),
+    windowCandidate.actions.some(
+      (action) => action.kind === "invoke_menu" && action.actionRef,
+    ),
     false,
   );
 
@@ -321,10 +454,8 @@ test("native manager publishes only opaque capabilities and binds a fixed AXPres
   );
   assert.ok(safe);
   assert.equal(
-    safe.actions.some(
-      (action) => action.kind === "press_key" || action.kind === "scroll",
-    ),
-    false,
+    safe.actions.some((action) => action.kind === "press_key"),
+    true,
   );
   const click = actionWith(safe.actions, (action) => action.kind === "click");
 
@@ -348,8 +479,8 @@ test("native manager publishes only opaque capabilities and binds a fixed AXPres
   const syntheticText = text.actions.find(
     (action) => action.kind === "type_text",
   );
-  assert.equal(syntheticText?.availability, "not_exposed");
-  assert.equal(syntheticText?.actionRef, undefined);
+  assert.equal(syntheticText?.availability, "approval_required");
+  assert.match(syntheticText?.actionRef ?? "", /^nact_/u);
 
   const forbidden = observation.candidates.find(
     (candidate) => candidate.label === "Delete account",
@@ -412,6 +543,70 @@ test("native manager publishes only opaque capabilities and binds a fixed AXPres
   assert.equal(core.endCalls, 1);
 });
 
+test("native manager wraps visual regions and pixel clicks in opaque one-shot refs", async () => {
+  const core = new FakeCore();
+  const manager = new NativeRunManager({ createCore: () => core });
+  const { start, window } = await started(manager);
+  assert.deepEqual(
+    await manager.visualDisclosureContext({
+      runRef: start.runRef,
+      windowRef: window.windowRef,
+    }),
+    {
+      appLabel: "Fixture App",
+      windowLabel: "Fixture Window",
+      untrustedUiData: true,
+    },
+  );
+  const visual = await manager.observeVisual({
+    runRef: start.runRef,
+    windowRef: window.windowRef,
+  });
+  assert.match(visual.visualObservationRef, /^nvobs_/u);
+  assert.match(visual.regions[0]?.regionRef ?? "", /^nvreg_/u);
+  assert.equal(visual.regions[0]?.label, "A1");
+  assert.doesNotMatch(
+    JSON.stringify(visual.regions),
+    /core-|coordinates|xPx|yPx/u,
+  );
+
+  const detail = await manager.refineVisual({
+    runRef: start.runRef,
+    visualObservationRef: visual.visualObservationRef,
+    regionRef: visual.regions[0]!.regionRef,
+  });
+  const cell = detail.observation.candidates[0];
+  assert.ok(cell);
+  assert.equal(cell.targetKind, "visual_cell");
+  const click = cell.actions.find((action) => action.kind === "click");
+  assert.equal(click?.availability, "approval_required");
+  assert.match(click?.actionRef ?? "", /^nact_/u);
+  assert.doesNotMatch(
+    JSON.stringify(detail.observation),
+    /core-|coordinates|xPx|yPx|from_zoom/u,
+  );
+
+  const contexts: unknown[] = [];
+  const result = await manager.step({
+    runRef: start.runRef,
+    operationKey: "visual-manager-click-once",
+    observationRef: detail.observation.observationRef,
+    actionRef: click!.actionRef!,
+    verification: VISUAL_VERIFICATION,
+    authorize: async (context) => {
+      contexts.push(context);
+      return { status: "approved" };
+    },
+  });
+  assert.equal(result.outcome, "verified");
+  assert.deepEqual(core.executions.at(-1)?.action, { kind: "click" });
+  assert.equal(
+    (contexts[0] as { actionDescription: string }).actionDescription,
+    "Click visual grid cell D4",
+  );
+  await manager.shutdown();
+});
+
 test("native manager binds one-shot approval to exact click and non-sensitive set-value actions", async () => {
   const core = new FakeCore();
   const manager = new NativeRunManager({ createCore: () => core });
@@ -450,6 +645,7 @@ test("native manager binds one-shot approval to exact click and non-sensitive se
     operationFingerprint: (contexts[0] as { operationFingerprint: string })
       .operationFingerprint,
     actionKind: "click",
+    actionDescription: "Press this control",
     risk: "r3_consequential",
     appLabel: "Fixture App",
     windowLabel: "Fixture Window",
@@ -522,7 +718,7 @@ test("native manager rejects recognizable credentials before approval or executi
       observationRef: observation.observationRef,
       actionRef: setValue.actionRef,
       verification: VERIFICATION,
-      text: "apikey_0123456789abcdef0123456789abcdef",
+      text: `api${"_key="}fixturecredential1234`,
       authorize: async () => {
         approvals += 1;
         return { status: "approved" };

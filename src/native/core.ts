@@ -15,6 +15,22 @@ import {
   truncateUntrusted,
 } from "../util.js";
 import { NativeOperationStore } from "./operation-store.js";
+import {
+  assertExactLaunchCapability,
+  parseLaunchReceipt,
+  verifyLaunchedIdentity,
+} from "./lifecycle.js";
+import {
+  assertExactVisualFreshness,
+  bindNormalizedVisualPoint,
+  createOpaqueVisualGrid,
+  validateCuaWindowScreenshot,
+  validateCuaZoomScreenshot,
+  type NativeVisualCapture,
+  type NativeVisualPointBinding,
+  type NativeVisualZoomCapture,
+  type NormalizedVisualPoint,
+} from "./visual.js";
 import type {
   NativeAction,
   NativeActionKind,
@@ -26,8 +42,11 @@ import type {
   NativeEndResult,
   NativeExecutionOutcome,
   NativeExecutionResult,
+  NativeLaunchResult,
   NativeObservation,
   NativeVerification,
+  NativeVisualDetail,
+  NativeVisualOverview,
   NativeWindowSummary,
   NativeWindowTarget,
 } from "./types.js";
@@ -38,9 +57,14 @@ const REQUIRED_TOOLS = new Set([
   "list_apps",
   "list_windows",
   "get_window_state",
+  "launch_app",
+  "zoom",
   "click",
+  "type_text",
   "set_value",
+  "press_key",
   "scroll",
+  "invoke_menu",
   "verify_state",
 ]);
 
@@ -75,11 +99,24 @@ const SAFE_KEYS = new Set([
   "pagedown",
 ]);
 
+const TEXT_CONTROL_ROLE = /(?:Text(?:Field|Area)|SearchField|ComboBox)$/iu;
+const KEY_TARGET_ROLE =
+  /(?:Text(?:Field|Area)|SearchField|ComboBox|PopUpButton|List|Table|Outline|Tree|TabGroup|Slider|Incrementor|ScrollArea|WebArea)$/iu;
+const MENU_ITEM_ROLE = /(?:^|\b)AXMenuItem$/u;
+const MENU_BAR_ITEM_ROLE = /(?:^|\b)AXMenuBarItem$/u;
+const MENU_CONTAINER_ROLE = /(?:^|\b)AXMenu$/u;
+const MENU_BAR_ROLE = /(?:^|\b)AXMenuBar$/u;
+const APPLE_MENU_LABEL = /^(?:apple|\uF8FF)$/iu;
+const UNSAFE_MENU_BRANCH =
+  /^(?:services|recent items|open recent|share|speech)$/iu;
+const UNSAFE_MENU_LEAF =
+  /^(?:close(?: window)?|force quit(?:\u2026|\.\.\.)?|quit(?: .+)?|restart(?:\u2026|\.\.\.)?|shut ?down(?:\u2026|\.\.\.)?|sleep|lock screen|log ?out(?: .+)?(?:\u2026|\.\.\.)?)$/iu;
+
 // A general UI label is not authority to mutate. Unknown AXPress controls are
 // consequential by default because bland labels such as "Continue" can submit
-// forms or commit remote state. Native v1 automatically binds only this narrow
-// set of locally reversible controls; broader actions need an approval path or
-// a reviewed compiled workflow.
+// forms or commit remote state. Native mode automatically binds only this
+// narrow set of locally reversible controls; broader actions need an approval
+// path or a reviewed compiled workflow.
 const APPLE_CALCULATOR_PATH = "/System/Applications/Calculator.app";
 const CALCULATOR_REVERSIBLE_CLICK_LABELS = Object.freeze([
   /^(?:[0-9]|zero|one|two|three|four|five|six|seven|eight|nine)$/iu,
@@ -99,7 +136,7 @@ function clickIsLocallyReversible(
   ) {
     return true;
   }
-  // Accessibility roles and labels are app-controlled. Native v1 therefore
+  // Accessibility roles and labels are app-controlled. Native mode therefore
   // grants no generic AXPress authority without a reviewed app identity.
   void element;
   return false;
@@ -149,6 +186,9 @@ type ExactWindowTarget = Readonly<{
 type AppCapability = Readonly<{
   bundleId: string;
   launchPath: string | null;
+  name: string;
+  running: boolean;
+  active: boolean;
   pid: number;
 }>;
 
@@ -159,6 +199,7 @@ type WindowCapability = Readonly<{
 
 type CapturedWindow = Readonly<{
   target: ExactWindowTarget;
+  appName: string;
   complete: boolean;
   actionable: boolean;
   elements: readonly ParsedElement[];
@@ -168,12 +209,36 @@ type CandidateBinding = Readonly<{
   observationId: string;
   target: ExactWindowTarget;
   publicTarget: NativeWindowTarget;
-  targetKind: "window" | "element";
+  targetKind: "window" | "element" | "visual_cell";
+  role: string;
+  label: string | null;
   elementIndex: number | null;
   identityDigest: string;
+  menuPath: readonly string[] | null;
+  visualPoint: NativeVisualPointBinding | null;
+  visualRootCapture: NativeVisualCapture | null;
+  visualZoomBounds: Readonly<{
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  }> | null;
+  visualZoomCapture: NativeVisualZoomCapture | null;
   actionKinds: readonly NativeActionKind[];
   clickActivations: readonly NativeClickActivation[];
   riskByAction: Readonly<Partial<Record<NativeActionKind, RiskClass>>>;
+}>;
+
+type VisualOverviewRecord = Readonly<{
+  target: ExactWindowTarget;
+  publicTarget: NativeWindowTarget;
+  capture: NativeVisualCapture;
+  regions: ReadonlyMap<string, NormalizedVisualPoint>;
+}>;
+
+type VisualRebind = Readonly<{
+  kind: "visual";
+  point: NativeVisualPointBinding;
 }>;
 
 type ObservationRecord = Readonly<{
@@ -415,28 +480,139 @@ function clickActivations(
   );
 }
 
+function exactMenuLabel(value: string | null): string | undefined {
+  if (value === null) return undefined;
+  const label = value.trim();
+  if (label.length < 1 || label.length > 200 || /[\p{Cc}\p{Cf}]/u.test(label)) {
+    return undefined;
+  }
+  return label;
+}
+
+/**
+ * Turn AX menu leaves into exact, local-only menu capabilities. The first
+ * menu-bar branch is excluded even if its label is absent or localized: on
+ * macOS it is the Apple menu and can contain host-wide power/session actions.
+ * Other unsafe branches and leaves are omitted instead of merely relying on a
+ * caller to notice their risk classification.
+ */
+function menuPaths(
+  elements: readonly ParsedElement[],
+  appName: string,
+): ReadonlyMap<number, readonly string[]> {
+  const byIndex = new Map(elements.map((element) => [element.index, element]));
+  const children = new Map<number, ParsedElement[]>();
+  for (const element of elements) {
+    if (element.parentIndex === null) continue;
+    const siblings = children.get(element.parentIndex) ?? [];
+    siblings.push(element);
+    children.set(element.parentIndex, siblings);
+  }
+  // On macOS the first two menu-bar branches are the Apple and application
+  // menus. Omit both structurally: app inventory names are not guaranteed to
+  // equal the localized/abbreviated application-menu title.
+  const reservedMenuRoots = new Set(
+    elements
+      .filter((element) => MENU_BAR_ITEM_ROLE.test(element.role))
+      .slice(0, 2)
+      .map((element) => element.index),
+  );
+  const applicationMenuLabel = exactMenuLabel(appName)?.normalize("NFKC");
+  const result = new Map<number, readonly string[]>();
+  for (const leaf of elements) {
+    if (
+      !MENU_ITEM_ROLE.test(leaf.role) ||
+      leaf.enabled === false ||
+      !leaf.actions.includes("AXPress") ||
+      (children.get(leaf.index) ?? []).some((child) =>
+        MENU_CONTAINER_ROLE.test(child.role),
+      )
+    ) {
+      continue;
+    }
+    const reversed: string[] = [];
+    const seen = new Set<number>();
+    let current: ParsedElement | undefined = leaf;
+    let rootIndex: number | undefined;
+    let structurallyValid = true;
+    while (current) {
+      if (seen.has(current.index)) {
+        structurallyValid = false;
+        break;
+      }
+      seen.add(current.index);
+      if (MENU_ITEM_ROLE.test(current.role)) {
+        const label = exactMenuLabel(current.label);
+        if (!label) {
+          structurallyValid = false;
+          break;
+        }
+        reversed.push(label);
+      } else if (MENU_BAR_ITEM_ROLE.test(current.role)) {
+        const label = exactMenuLabel(current.label);
+        if (!label) {
+          structurallyValid = false;
+          break;
+        }
+        reversed.push(label);
+        rootIndex = current.index;
+        break;
+      } else if (
+        !MENU_CONTAINER_ROLE.test(current.role) &&
+        !MENU_BAR_ROLE.test(current.role)
+      ) {
+        structurallyValid = false;
+        break;
+      }
+      current =
+        current.parentIndex === null
+          ? undefined
+          : byIndex.get(current.parentIndex);
+    }
+    if (!structurallyValid || rootIndex === undefined) continue;
+    const path = reversed.reverse();
+    if (
+      path.length < 2 ||
+      path.length > 16 ||
+      reservedMenuRoots.has(rootIndex) ||
+      APPLE_MENU_LABEL.test(path[0]!) ||
+      (applicationMenuLabel !== undefined &&
+        path[0]!.normalize("NFKC") === applicationMenuLabel) ||
+      path.some((part) => UNSAFE_MENU_BRANCH.test(part)) ||
+      UNSAFE_MENU_LEAF.test(path.at(-1)!) ||
+      classifyLabelRisk(path.join(" > ")) === "r4_forbidden"
+    ) {
+      continue;
+    }
+    result.set(leaf.index, Object.freeze(path));
+  }
+  return result;
+}
+
 function actionKindsForElement(
   element: ParsedElement,
+  menuPath?: readonly string[],
 ): readonly NativeActionKind[] {
   const kinds: NativeActionKind[] = [];
-  // Cua's window snapshot can contain the app's global menu tree. Those menu
-  // items are not children of the intended content workflow and can include
-  // OS-wide actions such as restart, logout, and shutdown. Menu invocation
-  // requires a separately reviewed path capability and is not part of v1.
-  if (/Menu(?:Bar)?Item/iu.test(element.role)) return Object.freeze(kinds);
+  if (MENU_ITEM_ROLE.test(element.role)) {
+    if (menuPath) kinds.push("invoke_menu");
+    return Object.freeze(kinds);
+  }
+  if (MENU_BAR_ITEM_ROLE.test(element.role)) return Object.freeze(kinds);
   // The public native facade binds click actions to AXPress. Do not advertise
   // a generic click for menu-only/pick-only controls, because the caller must
   // never choose an executable AX action string.
   if (clickActivations(element).includes("press")) kinds.unshift("click");
-  // V1 exposes only Accessibility set-value for text entry. Synthetic typing
-  // and secure/unobservable fields need a separate secure-input design.
   if (
     !/Secure/iu.test(element.role) &&
     element.value !== null &&
-    /Text(Field|Area)|SearchField|ComboBox/iu.test(element.role)
+    TEXT_CONTROL_ROLE.test(element.role)
   ) {
     kinds.push("set_value");
+    kinds.push("type_text");
   }
+  if (!/Secure/iu.test(element.role) && KEY_TARGET_ROLE.test(element.role))
+    kinds.push("press_key");
   return Object.freeze([...new Set(kinds)]);
 }
 
@@ -556,6 +732,7 @@ function maximumRisk(left: RiskClass, right: RiskClass): RiskClass {
 function riskByActionForElement(
   target: ExactWindowTarget,
   element: ParsedElement,
+  menuPath?: readonly string[],
 ): Readonly<Partial<Record<NativeActionKind, RiskClass>>> {
   const label = safeUiText(element.label ?? element.role);
   const classifiedLabelRisk = classifyLabelRisk(label);
@@ -566,10 +743,22 @@ function riskByActionForElement(
         ? "r1_reversible"
         : "r3_consequential";
   const risks: Partial<Record<NativeActionKind, RiskClass>> = {};
-  const kinds = actionKindsForElement(element);
+  const kinds = actionKindsForElement(element, menuPath);
   if (kinds.includes("click")) risks.click = clickRisk;
   if (kinds.includes("set_value"))
     risks.set_value = maximumRisk(classifiedLabelRisk, "r2_private");
+  if (kinds.includes("type_text"))
+    risks.type_text = maximumRisk(classifiedLabelRisk, "r2_private");
+  if (kinds.includes("press_key"))
+    risks.press_key = maximumRisk(classifiedLabelRisk, "r1_reversible");
+  if (kinds.includes("invoke_menu")) {
+    const pathRisk = classifyLabelRisk(
+      safeUiText((menuPath ?? []).join(" > ")),
+    );
+    // Exact menu invocation is powerful even when its app-provided label looks
+    // harmless. Unknown menu commands therefore need one-shot approval.
+    risks.invoke_menu = maximumRisk(pathRisk, "r3_consequential");
+  }
   return Object.freeze(risks);
 }
 
@@ -587,7 +776,7 @@ function actionRisk(
   if (action.kind === "invoke_menu") {
     risk = maximumRisk(
       risk,
-      classifyLabelRisk(safeUiText(action.path.join(" > "))),
+      classifyLabelRisk(safeUiText((binding.menuPath ?? []).join(" > "))),
     );
   }
   return risk;
@@ -654,18 +843,7 @@ function validateAction(action: NativeAction): void {
         throw new Error("native scroll amount is invalid");
       return;
     case "invoke_menu":
-      if (
-        !Array.isArray(action.path) ||
-        action.path.length < 1 ||
-        action.path.length > 16 ||
-        action.path.some(
-          (part) =>
-            typeof part !== "string" ||
-            !part.trim() ||
-            part.length > 200 ||
-            part !== part.trim(),
-        )
-      )
+      if (Object.keys(action).length !== 1)
         throw new Error("native menu path is invalid");
       return;
   }
@@ -674,6 +852,7 @@ function validateAction(action: NativeAction): void {
 function parseNativeReceipt(
   action: NativeAction,
   output: Record<string, unknown>,
+  pixelClick = false,
 ): NativeReceipt {
   if (output.effect !== "confirmed" && output.effect !== "unverifiable")
     throw new DriverToolError(
@@ -688,7 +867,7 @@ function parseNativeReceipt(
       "native action returned an unsupported delivery route",
     );
   const expectedRoutes: ReadonlySet<string> =
-    action.kind === "click" ||
+    (action.kind === "click" && !pixelClick) ||
     action.kind === "set_value" ||
     action.kind === "invoke_menu"
       ? new Set(["accessibility"])
@@ -757,10 +936,15 @@ export class NativeComputerUseCore {
   private readonly windows = new Map<string, WindowCapability>();
   private readonly candidates = new Map<string, CandidateBinding>();
   private readonly observations = new Map<string, ObservationRecord>();
+  private readonly visualOverviews = new Map<string, VisualOverviewRecord>();
   private readonly currentObservationByTarget = new Map<string, string>();
   private readonly executionTombstones = new Map<
     string,
     Readonly<{ requestDigest: string; result: NativeExecutionResult }>
+  >();
+  private readonly launchTombstones = new Map<
+    string,
+    Readonly<{ requestDigest: string; result: NativeLaunchResult }>
   >();
   private releaseLease: (() => Promise<void>) | undefined;
   private started = false;
@@ -800,6 +984,9 @@ export class NativeComputerUseCore {
             Object.freeze({
               bundleId: app.bundleId,
               launchPath: app.launchPath,
+              name: app.name,
+              running: app.running,
+              active: app.active,
               pid: app.pid,
             }),
           );
@@ -809,8 +996,230 @@ export class NativeComputerUseCore {
             name: safeUiText(app.name),
             running: app.running,
             active: app.active,
+            launchable: !app.running && app.launchPath !== null,
             untrustedText: true as const,
           });
+        }),
+      );
+    });
+  }
+
+  async launchApp(
+    input: Readonly<{
+      appRef: string;
+      operationKey: string;
+    }>,
+  ): Promise<NativeLaunchResult> {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const capability = this.apps.get(input.appRef);
+      if (!capability)
+        throw new Error("native app capability is stale or invalid");
+      const requestDigest = createHmac("sha256", this.identityKey)
+        .update("jev-cua:native-launch-call:v1\0", "utf8")
+        .update(
+          JSON.stringify({
+            appRef: input.appRef,
+            bundleId: capability.bundleId,
+            launchPath: capability.launchPath,
+          }),
+          "utf8",
+        )
+        .digest("hex");
+      const prior = this.launchTombstones.get(input.operationKey);
+      if (prior) {
+        if (prior.requestDigest !== requestDigest)
+          throw new Error("native operation key was used for another request");
+        return prior.result;
+      }
+      if (this.poisoned) {
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false,
+          }),
+        );
+      }
+
+      const inventory = await this.readApps();
+      const alreadyRunning = inventory.filter(
+        (app) =>
+          app.bundleId === capability.bundleId &&
+          app.launchPath === capability.launchPath &&
+          app.running,
+      );
+      if (alreadyRunning.length === 1) {
+        const app = alreadyRunning[0]!;
+        this.apps.set(input.appRef, Object.freeze({ ...app }));
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "denied",
+            reasonCode: "app_already_running",
+            app: this.appSummary(input.appRef, app),
+            mutationAttempted: false,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: false,
+          }),
+        );
+      }
+      try {
+        assertExactLaunchCapability(capability, inventory);
+      } catch {
+        return Object.freeze({
+          outcome: "unknown",
+          reasonCode: "stale_app",
+          mutationAttempted: false,
+          reconciliationRequired: false,
+          safeToRetry: true,
+          replayed: false,
+        });
+      }
+
+      const requestIdentity = JSON.stringify({
+        schema: "jev-cua.native-launch-request.v1",
+        runId: this.runId,
+        bundleId: capability.bundleId,
+        launchPath: capability.launchPath,
+      });
+      const existing = await this.dependencies.operations.lookup(
+        input.operationKey,
+        requestIdentity,
+      );
+      if (existing.status === "active") {
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false,
+          }),
+        );
+      }
+      if (existing.status === "complete") {
+        const running = (await this.readApps()).filter(
+          (app) =>
+            app.bundleId === capability.bundleId &&
+            app.launchPath === capability.launchPath &&
+            app.running,
+        );
+        if (existing.outcome !== "verified" || running.length !== 1) {
+          await this.poison("reconciliation_required");
+          return this.rememberLaunch(
+            input.operationKey,
+            requestDigest,
+            Object.freeze({
+              outcome: "unknown",
+              reasonCode: "reconciliation_required",
+              mutationAttempted: true,
+              reconciliationRequired: true,
+              safeToRetry: false,
+              replayed: true,
+            }),
+          );
+        }
+        const app = running[0]!;
+        this.apps.set(input.appRef, Object.freeze({ ...app }));
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "verified",
+            reasonCode: "idempotent_replay",
+            app: this.appSummary(input.appRef, app),
+            mutationAttempted: true,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: true,
+          }),
+        );
+      }
+
+      const reserved = await this.dependencies.operations.reserve(
+        input.operationKey,
+        requestIdentity,
+        this.runId,
+      );
+      if (reserved.status !== "reserved") {
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: reserved.status === "complete",
+          }),
+        );
+      }
+
+      let launched: ParsedApp;
+      try {
+        const raw = await this.dependencies.driver.call("launch_app", {
+          bundle_id: capability.bundleId,
+        });
+        const receipt = parseLaunchReceipt(capability, raw);
+        launched = verifyLaunchedIdentity(
+          capability,
+          receipt,
+          await this.readApps(),
+        );
+      } catch {
+        await this.completeOperation(
+          input.operationKey,
+          reserved.operationId,
+          "unknown",
+        );
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "ambiguous_dispatch",
+            mutationAttempted: true,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false,
+          }),
+        );
+      }
+
+      await this.completeOperation(
+        input.operationKey,
+        reserved.operationId,
+        "verified",
+      );
+      this.windows.clear();
+      this.clearObservations();
+      this.apps.set(input.appRef, Object.freeze({ ...launched }));
+      return this.rememberLaunch(
+        input.operationKey,
+        requestDigest,
+        Object.freeze({
+          outcome: "verified",
+          reasonCode: "app_launched",
+          app: this.appSummary(input.appRef, launched),
+          mutationAttempted: true,
+          reconciliationRequired: false,
+          safeToRetry: false,
+          replayed: false,
         }),
       );
     });
@@ -876,6 +1285,157 @@ export class NativeComputerUseCore {
     });
   }
 
+  async observeVisual(
+    target: NativeWindowTarget,
+  ): Promise<NativeVisualOverview> {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const capability = this.windows.get(target.windowRef);
+      if (!capability)
+        throw new Error("native window capability is stale or invalid");
+      const capture = await this.captureVisualWindow(capability.target);
+      this.invalidateTarget(capability.target);
+      const overviewId = randomOpaqueId("nvobs");
+      const grid = createOpaqueVisualGrid(capture.digest, this.identityKey);
+      const regions = new Map<string, NormalizedVisualPoint>();
+      for (const cell of grid.descriptor.cells)
+        regions.set(cell.cellRef, grid.resolveCell(cell.cellRef));
+      this.visualOverviews.set(
+        overviewId,
+        Object.freeze({
+          target: capability.target,
+          publicTarget: target,
+          capture,
+          regions,
+        }),
+      );
+      return Object.freeze({
+        id: overviewId,
+        target,
+        width: capture.width,
+        height: capture.height,
+        image: capture.image,
+        regions: Object.freeze(
+          grid.descriptor.cells.map((cell) =>
+            Object.freeze({ id: cell.cellRef, label: cell.label }),
+          ),
+        ),
+      });
+    });
+  }
+
+  async refineVisual(
+    input: Readonly<{
+      overviewId: string;
+      regionId: string;
+    }>,
+  ): Promise<NativeVisualDetail> {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const overview = this.visualOverviews.get(input.overviewId);
+      const point = overview?.regions.get(input.regionId);
+      if (!overview || !point)
+        throw new Error(
+          "native visual observation capability is stale or invalid",
+        );
+
+      const freshRoot = await this.captureVisualWindow(overview.target);
+      assertExactVisualFreshness(overview.capture, freshRoot);
+      const halfCell = 1 / 16;
+      const bounds = Object.freeze({
+        x1: Math.max(
+          0,
+          Math.floor((point.x - halfCell) * overview.capture.width),
+        ),
+        y1: Math.max(
+          0,
+          Math.floor((point.y - halfCell) * overview.capture.height),
+        ),
+        x2: Math.min(
+          overview.capture.width,
+          Math.ceil((point.x + halfCell) * overview.capture.width),
+        ),
+        y2: Math.min(
+          overview.capture.height,
+          Math.ceil((point.y + halfCell) * overview.capture.height),
+        ),
+      });
+      const zoom = await this.captureZoom(overview.target, bounds);
+      const grid = createOpaqueVisualGrid(zoom.digest, this.identityKey);
+
+      this.invalidateTarget(overview.target);
+      const observationId = randomOpaqueId("nobs");
+      const candidateIds: string[] = [];
+      const candidates: NativeCandidate[] = [];
+      for (const cell of grid.descriptor.cells) {
+        const candidateId = randomOpaqueId("ncand");
+        const visualPoint = bindNormalizedVisualPoint(
+          zoom,
+          grid.resolveCell(cell.cellRef),
+        );
+        const binding: CandidateBinding = Object.freeze({
+          observationId,
+          target: overview.target,
+          publicTarget: overview.publicTarget,
+          targetKind: "visual_cell",
+          role: "VisualGridCell",
+          label: cell.label,
+          elementIndex: null,
+          identityDigest: this.identityDigest(
+            `visual\0${overview.capture.digest}\0${zoom.digest}\0${cell.label}`,
+          ),
+          menuPath: null,
+          visualPoint,
+          visualRootCapture: overview.capture,
+          visualZoomBounds: bounds,
+          visualZoomCapture: zoom,
+          actionKinds: Object.freeze<NativeActionKind[]>(["click"]),
+          clickActivations: Object.freeze<NativeClickActivation[]>([]),
+          riskByAction: Object.freeze({ click: "r3_consequential" }),
+        });
+        this.candidates.set(candidateId, binding);
+        candidateIds.push(candidateId);
+        candidates.push(
+          Object.freeze({
+            id: candidateId,
+            targetKind: "visual_cell",
+            role: "VisualGridCell",
+            label: cell.label,
+            valuePresent: false,
+            enabled: true,
+            selected: null,
+            actionKinds: binding.actionKinds,
+            riskByAction: binding.riskByAction,
+            untrustedText: true,
+          }),
+        );
+      }
+      const key = targetKey(overview.target);
+      this.observations.set(
+        observationId,
+        Object.freeze({
+          targetKey: key,
+          candidateIds: Object.freeze(candidateIds),
+        }),
+      );
+      this.currentObservationByTarget.set(key, observationId);
+      return Object.freeze({
+        observation: Object.freeze({
+          id: observationId,
+          target: overview.publicTarget,
+          complete: true,
+          actionable: true,
+          candidateCount: candidates.length,
+          candidates: Object.freeze(candidates),
+          untrustedUiData: true,
+        }),
+        width: zoom.width,
+        height: zoom.height,
+        image: zoom.image,
+      });
+    });
+  }
+
   async execute(
     input: Readonly<{
       operationKey: string;
@@ -915,6 +1475,38 @@ export class NativeComputerUseCore {
       );
       if (!binding.actionKinds.includes(input.action.kind))
         throw new Error("native action is not available for this candidate");
+
+      let exactExpectedValue: string | undefined;
+      if (input.action.kind === "set_value") {
+        exactExpectedValue = input.action.value;
+      } else if (input.action.kind === "type_text") {
+        const predicate = input.verification.expect[0];
+        const element =
+          input.verification.expect.length === 1 &&
+          predicate &&
+          "element" in predicate
+            ? predicate.element
+            : undefined;
+        const selector = element?.selector;
+        const matchesBoundControl =
+          element !== undefined &&
+          typeof element.valueEquals === "string" &&
+          (selector?.role === undefined || selector.role === binding.role) &&
+          (selector?.labelContains === undefined ||
+            (binding.label !== null &&
+              binding.label.includes(selector.labelContains)));
+        if (!matchesBoundControl) {
+          return Object.freeze({
+            outcome: "denied",
+            reasonCode: "verification_mismatch",
+            mutationAttempted: false,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: false,
+          });
+        }
+        exactExpectedValue = element.valueEquals;
+      }
 
       const risk = actionRisk(input.action, binding);
       if (risk === "r4_forbidden") {
@@ -1101,9 +1693,14 @@ export class NativeComputerUseCore {
         }
       }
 
-      let fresh: CapturedWindow;
+      let rebound: ParsedElement | VisualRebind | null | undefined;
       try {
-        fresh = await this.captureWindow(binding.target);
+        if (binding.targetKind === "visual_cell") {
+          rebound = await this.rebindVisual(binding);
+        } else {
+          const fresh = await this.captureWindow(binding.target);
+          rebound = this.rebind(binding, fresh, input.action);
+        }
       } catch {
         const result = Object.freeze({
           outcome: "unknown" as const,
@@ -1117,7 +1714,6 @@ export class NativeComputerUseCore {
           ? this.rememberExecution(input.operationKey, callDigest, result)
           : result;
       }
-      const rebound = this.rebind(binding, fresh, input.action);
       if (rebound === undefined) {
         const result = Object.freeze({
           outcome: "unknown" as const,
@@ -1134,6 +1730,7 @@ export class NativeComputerUseCore {
       if (
         input.action.kind === "set_value" &&
         rebound !== null &&
+        !("kind" in rebound) &&
         rebound.value === input.action.value
       ) {
         const result = Object.freeze({
@@ -1149,11 +1746,7 @@ export class NativeComputerUseCore {
           : result;
       }
 
-      const actionArgs = this.actionArguments(
-        binding.target,
-        rebound,
-        input.action,
-      );
+      const actionArgs = this.actionArguments(binding, rebound, input.action);
       const reserved = await this.dependencies.operations.reserve(
         input.operationKey,
         requestIdentity,
@@ -1181,9 +1774,15 @@ export class NativeComputerUseCore {
           input.action.kind,
           actionArgs,
         );
-        receipt = parseNativeReceipt(input.action, raw);
+        receipt = parseNativeReceipt(
+          input.action,
+          raw,
+          binding.targetKind === "visual_cell",
+        );
       } catch {
-        await this.captureWindow(binding.target).catch(() => undefined);
+        if (binding.targetKind === "visual_cell")
+          await this.captureVisualWindow(binding.target).catch(() => undefined);
+        else await this.captureWindow(binding.target).catch(() => undefined);
         await this.poison("reconciliation_required");
         return this.rememberExecution(
           input.operationKey,
@@ -1199,11 +1798,13 @@ export class NativeComputerUseCore {
         );
       }
 
-      let postActionCapture: CapturedWindow;
+      let postActionCapture: CapturedWindow | undefined;
       try {
-        postActionCapture = await this.captureWindow(binding.target);
-        if (!postActionCapture.actionable)
-          throw new Error("native post-action observation is not actionable");
+        if (binding.targetKind !== "visual_cell") {
+          postActionCapture = await this.captureWindow(binding.target);
+          if (!postActionCapture.actionable)
+            throw new Error("native post-action observation is not actionable");
+        }
       } catch {
         await this.completeOperation(
           input.operationKey,
@@ -1227,7 +1828,9 @@ export class NativeComputerUseCore {
         );
       }
 
-      if (input.action.kind === "set_value") {
+      if (exactExpectedValue !== undefined) {
+        if (!postActionCapture)
+          throw new Error("native value verification capture is unavailable");
         const requiredSamples = input.verification.stableSamples ?? 2;
         let exactStatus: "verified" | "refuted" | "unknown" = "verified";
         let exactCapture = postActionCapture;
@@ -1252,7 +1855,7 @@ export class NativeComputerUseCore {
             exactStatus = "unknown";
             break;
           }
-          if (exactPostActionElement.value !== input.action.value) {
+          if (exactPostActionElement.value !== exactExpectedValue) {
             exactStatus = "refuted";
             break;
           }
@@ -1399,7 +2002,9 @@ export class NativeComputerUseCore {
       this.candidates.clear();
       this.observations.clear();
       this.currentObservationByTarget.clear();
+      this.visualOverviews.clear();
       this.executionTombstones.clear();
+      this.launchTombstones.clear();
       this.identityKey.fill(0);
       return Object.freeze({
         cleanupSucceeded,
@@ -1492,6 +2097,18 @@ export class NativeComputerUseCore {
     return parseApps(await this.dependencies.driver.call("list_apps", {}));
   }
 
+  private appSummary(appRef: string, app: ParsedApp): NativeAppSummary {
+    return Object.freeze({
+      appRef,
+      bundleId: app.bundleId,
+      name: safeUiText(app.name),
+      running: app.running,
+      active: app.active,
+      launchable: !app.running && app.launchPath !== null,
+      untrustedText: true,
+    });
+  }
+
   private async assertAppBinding(
     bundleId: string,
     launchPath: string | null,
@@ -1520,7 +2137,11 @@ export class NativeComputerUseCore {
     target: ExactWindowTarget,
   ): Promise<CapturedWindow> {
     assertTarget(target);
-    await this.assertAppBinding(target.bundleId, target.launchPath, target.pid);
+    const app = await this.assertAppBinding(
+      target.bundleId,
+      target.launchPath,
+      target.pid,
+    );
     const windows = await this.readWindows(target.pid);
     if (
       windows.filter(
@@ -1545,10 +2166,77 @@ export class NativeComputerUseCore {
     const actionable = captureIsActionable(output, target, elements);
     return Object.freeze({
       target,
+      appName: app.name,
       complete: output.elements_complete === true && actionable,
       actionable,
       elements,
     });
+  }
+
+  private async captureVisualWindow(
+    target: ExactWindowTarget,
+  ): Promise<NativeVisualCapture> {
+    assertTarget(target);
+    await this.assertAppBinding(target.bundleId, target.launchPath, target.pid);
+    const windows = await this.readWindows(target.pid);
+    if (
+      windows.filter(
+        (window) =>
+          window.pid === target.pid && window.windowId === target.windowId,
+      ).length !== 1
+    ) {
+      throw new Error("native visual window binding is stale");
+    }
+    const callWithContent = this.dependencies.driver.callWithContent;
+    if (!callWithContent)
+      throw new Error("native visual capture is unavailable");
+    const result = await callWithContent.call(
+      this.dependencies.driver,
+      "get_window_state",
+      {
+        pid: target.pid,
+        window_id: target.windowId,
+        session: this.session,
+        include_screenshot: true,
+        include_accessibility_tree: false,
+        max_dimension: 1_600,
+      },
+    );
+    if (result.images.length !== 1)
+      throw new Error("native visual capture returned an ambiguous image set");
+    const capture = validateCuaWindowScreenshot(
+      result.structuredContent,
+      result.images[0],
+    );
+    if (capture.pid !== target.pid || capture.windowId !== target.windowId)
+      throw new Error("native visual capture crossed its exact window binding");
+    return capture;
+  }
+
+  private async captureZoom(
+    target: ExactWindowTarget,
+    bounds: Readonly<{ x1: number; y1: number; x2: number; y2: number }>,
+  ): Promise<NativeVisualZoomCapture> {
+    const callWithContent = this.dependencies.driver.callWithContent;
+    if (!callWithContent) throw new Error("native visual zoom is unavailable");
+    const result = await callWithContent.call(
+      this.dependencies.driver,
+      "zoom",
+      {
+        pid: target.pid,
+        window_id: target.windowId,
+        x1: bounds.x1,
+        y1: bounds.y1,
+        x2: bounds.x2,
+        y2: bounds.y2,
+      },
+    );
+    if (result.images.length !== 1)
+      throw new Error("native visual zoom returned an ambiguous image set");
+    return validateCuaZoomScreenshot(
+      result.structuredContent,
+      result.images[0],
+    );
   }
 
   private publishObservation(
@@ -1566,11 +2254,19 @@ export class NativeComputerUseCore {
         target: capture.target,
         publicTarget,
         targetKind: "window",
+        role: "AXWindow",
+        label: null,
         elementIndex: null,
         identityDigest: this.identityDigest("window"),
-        actionKinds: Object.freeze<NativeActionKind[]>(["scroll"]),
+        menuPath: null,
+        visualPoint: null,
+        visualRootCapture: null,
+        visualZoomBounds: null,
+        visualZoomCapture: null,
+        actionKinds: Object.freeze<NativeActionKind[]>(["press_key", "scroll"]),
         clickActivations: Object.freeze<NativeClickActivation[]>([]),
         riskByAction: Object.freeze({
+          press_key: "r1_reversible",
           scroll: "r1_reversible",
         }),
       });
@@ -1589,6 +2285,7 @@ export class NativeComputerUseCore {
       );
 
       const identities = this.elementIdentities(capture.elements);
+      const pathsByElement = menuPaths(capture.elements, capture.appName);
       const counts = new Map<string, number>();
       for (const digest of identities.values())
         counts.set(digest, (counts.get(digest) ?? 0) + 1);
@@ -1596,8 +2293,9 @@ export class NativeComputerUseCore {
         const digest = identities.get(element.index);
         if (!digest || counts.get(digest) !== 1 || element.enabled === false)
           continue;
-        const kinds = actionKindsForElement(element);
-        const risks = riskByActionForElement(capture.target, element);
+        const menuPath = pathsByElement.get(element.index);
+        const kinds = actionKindsForElement(element, menuPath);
+        const risks = riskByActionForElement(capture.target, element, menuPath);
         if (kinds.length === 0) continue;
         const id = randomOpaqueId("ncand");
         const binding: CandidateBinding = Object.freeze({
@@ -1605,8 +2303,15 @@ export class NativeComputerUseCore {
           target: capture.target,
           publicTarget,
           targetKind: "element",
+          role: element.role,
+          label: element.label,
           elementIndex: element.index,
           identityDigest: digest,
+          menuPath: menuPath ?? null,
+          visualPoint: null,
+          visualRootCapture: null,
+          visualZoomBounds: null,
+          visualZoomCapture: null,
           actionKinds: kinds,
           clickActivations: clickActivations(element),
           riskByAction: risks,
@@ -1618,7 +2323,11 @@ export class NativeComputerUseCore {
             id,
             targetKind: "element",
             role: safeUiText(element.role),
-            ...(element.label ? { label: safeUiText(element.label) } : {}),
+            ...(menuPath
+              ? { label: safeUiText(menuPath.join(" > ")) }
+              : element.label
+                ? { label: safeUiText(element.label) }
+                : {}),
             valuePresent: element.value !== null && element.value.length > 0,
             enabled: element.enabled,
             selected: element.selected,
@@ -1723,6 +2432,13 @@ export class NativeComputerUseCore {
       return undefined;
     if (binding.targetKind === "window") return null;
     const identities = this.elementIdentities(fresh.elements);
+    if (
+      fresh.elements.filter(
+        (element) => identities.get(element.index) === binding.identityDigest,
+      ).length !== 1
+    ) {
+      return undefined;
+    }
     const matches = fresh.elements.filter(
       (element) =>
         element.index === binding.elementIndex &&
@@ -1730,9 +2446,12 @@ export class NativeComputerUseCore {
     );
     if (matches.length !== 1) return undefined;
     const element = matches[0]!;
+    const freshMenuPath = menuPaths(fresh.elements, fresh.appName).get(
+      element.index,
+    );
     if (
       element.enabled === false ||
-      !actionKindsForElement(element).includes(action.kind)
+      !actionKindsForElement(element, freshMenuPath).includes(action.kind)
     )
       return undefined;
     if (action.kind === "click") {
@@ -1743,45 +2462,105 @@ export class NativeComputerUseCore {
       )
         return undefined;
     }
+    if (
+      action.kind === "invoke_menu" &&
+      (binding.menuPath === null ||
+        freshMenuPath === undefined ||
+        JSON.stringify(freshMenuPath) !== JSON.stringify(binding.menuPath))
+    ) {
+      return undefined;
+    }
     return element;
   }
 
+  private async rebindVisual(
+    binding: CandidateBinding,
+  ): Promise<VisualRebind | undefined> {
+    if (
+      binding.targetKind !== "visual_cell" ||
+      binding.visualPoint === null ||
+      binding.visualRootCapture === null ||
+      binding.visualZoomBounds === null ||
+      binding.visualZoomCapture === null
+    ) {
+      return undefined;
+    }
+    const root = await this.captureVisualWindow(binding.target);
+    assertExactVisualFreshness(binding.visualRootCapture, root);
+    const zoom = await this.captureZoom(
+      binding.target,
+      binding.visualZoomBounds,
+    );
+    if (
+      zoom.mimeType !== binding.visualZoomCapture.mimeType ||
+      zoom.width !== binding.visualZoomCapture.width ||
+      zoom.height !== binding.visualZoomCapture.height ||
+      zoom.digest !== binding.visualZoomCapture.digest ||
+      binding.visualPoint.captureDigest !== zoom.digest
+    ) {
+      return undefined;
+    }
+    return Object.freeze({ kind: "visual", point: binding.visualPoint });
+  }
+
   private actionArguments(
-    target: ExactWindowTarget,
-    element: ParsedElement | null,
+    binding: CandidateBinding,
+    rebound: ParsedElement | VisualRebind | null,
     action: NativeAction,
   ): Record<string, JsonValue> {
+    const target = binding.target;
     const base: Record<string, JsonValue> = {
       pid: target.pid,
       window_id: target.windowId,
       session: this.session,
     };
-    if (element) base.element_token = element.token;
+    const element =
+      rebound !== null && !("kind" in rebound) ? rebound : undefined;
+    const visual = rebound !== null && "kind" in rebound ? rebound : undefined;
+    const elementBase: Record<string, JsonValue> = element
+      ? { ...base, element_token: element.token }
+      : base;
     switch (action.kind) {
       case "click":
+        if (visual) {
+          return {
+            ...base,
+            x: visual.point.xPx,
+            y: visual.point.yPx,
+            from_zoom: true,
+            delivery_mode: "background",
+          };
+        }
         if (!element)
           throw new Error("native click requires an element capability");
         return {
-          ...base,
+          ...elementBase,
           action: action.activation ?? "press",
           delivery_mode: "background",
         };
       case "type_text":
         if (!element)
           throw new Error("native text entry requires an element capability");
-        return { ...base, text: action.text, delivery_mode: "background" };
+        return {
+          ...elementBase,
+          text: action.text,
+          delivery_mode: "background",
+        };
       case "set_value":
         if (!element)
           throw new Error("native value entry requires an element capability");
-        return { ...base, value: action.value };
+        return { ...elementBase, value: action.value };
       case "press_key":
+        if (visual)
+          throw new Error("native visual capabilities cannot press keys");
         return {
-          ...base,
+          ...elementBase,
           key: action.key.toLowerCase(),
           ...(action.modifiers ? { modifiers: [...action.modifiers] } : {}),
           delivery_mode: "background",
         };
       case "scroll":
+        if (visual) throw new Error("native visual capabilities cannot scroll");
         return {
           ...base,
           direction: action.direction,
@@ -1790,11 +2569,9 @@ export class NativeComputerUseCore {
           delivery_mode: "background",
         };
       case "invoke_menu":
-        if (element)
-          throw new Error(
-            "native menu invocation requires a window capability",
-          );
-        return { ...base, path: [...action.path] };
+        if (!element || binding.menuPath === null)
+          throw new Error("native menu invocation requires a menu capability");
+        return { ...base, path: [...binding.menuPath] };
     }
   }
 
@@ -1856,6 +2633,10 @@ export class NativeComputerUseCore {
 
   private invalidateTarget(target: ExactWindowTarget): void {
     const key = targetKey(target);
+    for (const [overviewId, overview] of this.visualOverviews) {
+      if (targetKey(overview.target) === key)
+        this.visualOverviews.delete(overviewId);
+    }
     const observationId = this.currentObservationByTarget.get(key);
     if (!observationId) return;
     const observation = this.observations.get(observationId);
@@ -1869,6 +2650,7 @@ export class NativeComputerUseCore {
     this.candidates.clear();
     this.observations.clear();
     this.currentObservationByTarget.clear();
+    this.visualOverviews.clear();
   }
 
   private async completeOperation(
@@ -1934,6 +2716,19 @@ export class NativeComputerUseCore {
     );
     return frozen;
   }
+
+  private rememberLaunch(
+    operationKey: string,
+    requestDigest: string,
+    result: NativeLaunchResult,
+  ): NativeLaunchResult {
+    const frozen = Object.freeze({ ...result });
+    this.launchTombstones.set(
+      operationKey,
+      Object.freeze({ requestDigest, result: frozen }),
+    );
+    return frozen;
+  }
 }
 
 export type {
@@ -1941,8 +2736,11 @@ export type {
   NativeAppSummary,
   NativeEndResult,
   NativeExecutionResult,
+  NativeLaunchResult,
   NativeObservation,
   NativeVerification,
+  NativeVisualDetail,
+  NativeVisualOverview,
   NativeWindowSummary,
   NativeWindowTarget,
 } from "./types.js";

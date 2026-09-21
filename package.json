@@ -2,7 +2,7 @@
   "name": "jev-cua",
   "version": "0.1.0",
   "private": true,
-  "description": "Guarded app-agnostic Mac Accessibility control plus deterministic Cua fast paths for Codex and Waku",
+  "description": "Guarded app-agnostic Mac computer use plus deterministic Cua fast paths for Codex and Waku",
   "type": "module",
   "engines": {
     "node": ">=24.21.0"

@@ -9,6 +9,7 @@ import { NativeComputerUseCore } from "../src/native/core.js";
 import { NativeOperationStore } from "../src/native/operation-store.js";
 import { DesktopLease, LiveExecutionBarrier, RunStore } from "../src/state.js";
 import type {
+  DriverCallResult,
   DriverClient,
   DriverToolDescriptor,
   JsonValue,
@@ -26,6 +27,8 @@ const REQUIRED_NATIVE_TOOLS = [
   "list_apps",
   "list_windows",
   "get_window_state",
+  "launch_app",
+  "zoom",
   "click",
   "type_text",
   "set_value",
@@ -35,6 +38,39 @@ const REQUIRED_NATIVE_TOOLS = [
   "verify_state",
 ] as const;
 
+function visualPng(width = 640, height = 480, revision = 0): Buffer {
+  const bytes = Buffer.alloc(25);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  bytes[24] = revision;
+  return bytes;
+}
+
+function visualJpeg(width = 276, height = 288): Buffer {
+  return Buffer.from([
+    0xff,
+    0xd8,
+    0xff,
+    0xc0,
+    0x00,
+    0x0b,
+    0x08,
+    (height >>> 8) & 0xff,
+    height & 0xff,
+    (width >>> 8) & 0xff,
+    width & 0xff,
+    0x01,
+    0x01,
+    0x11,
+    0x00,
+    0xff,
+    0xd9,
+  ]);
+}
+
 class NativeFixtureDriver implements DriverClient {
   readonly calls: Array<{
     tool: string;
@@ -43,13 +79,19 @@ class NativeFixtureDriver implements DriverClient {
   connected = false;
   stateReads = 0;
   actionCalls = 0;
+  launchCalls = 0;
   appPid: number = TARGET.pid;
+  appRunning = true;
   bundleId: string = TARGET.bundleId;
   launchPath = "/System/Applications/Calculator.app";
   elementRole = "AXButton";
   elementLabel = "Approve fixture";
   textRole = "AXTextField";
   textValue: string | null = "private@example.test";
+  appMenuRootLabel = "Fixture";
+  menuRootLabel = "View";
+  includeMenuTree = false;
+  duplicateMenuLeaf = false;
   elementsComplete = true;
   accessibilityAvailable = true;
   accessibilityAvailableAfterAction = true;
@@ -62,6 +104,8 @@ class NativeFixtureDriver implements DriverClient {
   malformedPostVerification = false;
   syntheticDeliveryMode: "background" | "not_applicable" = "background";
   throwOnAction = false;
+  visualRevision = 0;
+  visualChangesAfterClick = true;
   omitRequiredTool = false;
 
   async connect(): Promise<void> {
@@ -90,9 +134,9 @@ class NativeFixtureDriver implements DriverClient {
             bundle_id: this.bundleId,
             launch_path: this.launchPath,
             name: "Fixture App",
-            running: true,
+            running: this.appRunning,
             active: false,
-            pid: this.appPid,
+            pid: this.appRunning ? this.appPid : 0,
           },
         ],
       };
@@ -111,15 +155,193 @@ class NativeFixtureDriver implements DriverClient {
         ],
       };
     }
+    if (tool === "launch_app") {
+      this.launchCalls += 1;
+      this.appRunning = true;
+      this.appPid = 789;
+      return {
+        bundle_id: this.bundleId,
+        name: "Fixture App",
+        pid: this.appPid,
+        launch_state: {
+          requested: true,
+          process_running: true,
+          window_ready: true,
+        },
+        self_activation_suppressed: true,
+      };
+    }
     if (tool === "get_window_state") {
       this.stateReads += 1;
+      const elements: Array<Record<string, JsonValue>> = [
+        {
+          element_index: 7,
+          element_token: `private-token-${this.stateReads}`,
+          role: this.elementRole,
+          label: this.elementLabel,
+          value: "raw-secret-value",
+          actions: ["AXPress"],
+          enabled: true,
+          selected: false,
+          parent_index: null,
+        },
+        {
+          element_index: 8,
+          element_token: `private-text-token-${this.stateReads}`,
+          role: this.textRole,
+          label: "Account email",
+          value: this.textValue,
+          actions: [],
+          enabled: true,
+          selected: false,
+          parent_index: null,
+        },
+      ];
+      if (this.includeMenuTree) {
+        elements.push(
+          {
+            element_index: 20,
+            element_token: `menu-bar-${this.stateReads}`,
+            role: "AXMenuBar",
+            label: null,
+            value: null,
+            actions: [],
+            enabled: true,
+            selected: false,
+            parent_index: null,
+          },
+          {
+            element_index: 21,
+            element_token: `apple-root-${this.stateReads}`,
+            role: "AXMenuBarItem",
+            label: "Apple",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 20,
+          },
+          {
+            element_index: 22,
+            element_token: `apple-menu-${this.stateReads}`,
+            role: "AXMenu",
+            label: "Apple",
+            value: null,
+            actions: [],
+            enabled: true,
+            selected: false,
+            parent_index: 21,
+          },
+          {
+            element_index: 23,
+            element_token: `shutdown-${this.stateReads}`,
+            role: "AXMenuItem",
+            label: "Shut Down\u2026",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 22,
+          },
+          {
+            element_index: 28,
+            element_token: `app-root-${this.stateReads}`,
+            role: "AXMenuBarItem",
+            label: this.appMenuRootLabel,
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 20,
+          },
+          {
+            element_index: 29,
+            element_token: `app-menu-${this.stateReads}`,
+            role: "AXMenu",
+            label: this.appMenuRootLabel,
+            value: null,
+            actions: [],
+            enabled: true,
+            selected: false,
+            parent_index: 28,
+          },
+          {
+            element_index: 30,
+            element_token: `localized-quit-${this.stateReads}`,
+            role: "AXMenuItem",
+            label: "Beenden",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 29,
+          },
+          {
+            element_index: 24,
+            element_token: `menu-root-${this.stateReads}`,
+            role: "AXMenuBarItem",
+            label: this.menuRootLabel,
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 20,
+          },
+          {
+            element_index: 25,
+            element_token: `view-menu-${this.stateReads}`,
+            role: "AXMenu",
+            label: this.menuRootLabel,
+            value: null,
+            actions: [],
+            enabled: true,
+            selected: false,
+            parent_index: 24,
+          },
+          {
+            element_index: 26,
+            element_token: `sidebar-item-${this.stateReads}`,
+            role: "AXMenuItem",
+            label: "Show Sidebar",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 25,
+          },
+          {
+            element_index: 27,
+            element_token: `services-item-${this.stateReads}`,
+            role: "AXMenuItem",
+            label: "Services",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 25,
+          },
+        );
+        if (this.duplicateMenuLeaf) {
+          elements.push({
+            element_index: 31,
+            element_token: `sidebar-item-duplicate-${this.stateReads}`,
+            role: "AXMenuItem",
+            label: "Show Sidebar",
+            value: null,
+            actions: ["AXPress"],
+            enabled: true,
+            selected: false,
+            parent_index: 25,
+          });
+        }
+      }
       return {
         pid: this.appPid,
         window_id: TARGET.windowId,
         snapshot_id: `s0000000${this.stateReads}`,
-        element_count: 2,
-        returned_element_count: 2,
-        total_element_count: 2,
+        element_count: elements.length,
+        returned_element_count: elements.length,
+        total_element_count: elements.length,
         elements_complete: this.elementsComplete,
         truncated: false,
         degraded: false,
@@ -141,30 +363,7 @@ class NativeFixtureDriver implements DriverClient {
             },
           ],
         },
-        elements: [
-          {
-            element_index: 7,
-            element_token: `private-token-${this.stateReads}`,
-            role: this.elementRole,
-            label: this.elementLabel,
-            value: "raw-secret-value",
-            actions: ["AXPress"],
-            enabled: true,
-            selected: false,
-            parent_index: null,
-          },
-          {
-            element_index: 8,
-            element_token: `private-text-token-${this.stateReads}`,
-            role: this.textRole,
-            label: "Account email",
-            value: this.textValue,
-            actions: [],
-            enabled: true,
-            selected: false,
-            parent_index: null,
-          },
-        ],
+        elements,
       };
     }
     if (
@@ -182,15 +381,27 @@ class NativeFixtureDriver implements DriverClient {
         throw new DriverToolError(tool, true, "fixture dispatch failed");
       if (tool === "set_value" && typeof arguments_.value === "string")
         this.textValue = arguments_.value;
+      if (tool === "type_text" && typeof arguments_.text === "string")
+        this.textValue = arguments_.text;
+      if (
+        tool === "click" &&
+        arguments_.from_zoom === true &&
+        this.visualChangesAfterClick
+      )
+        this.visualRevision += 1;
       return {
         effect: "unverifiable",
         route:
-          tool === "click" || tool === "set_value" || tool === "invoke_menu"
+          (tool === "click" && arguments_.from_zoom !== true) ||
+          tool === "set_value" ||
+          tool === "invoke_menu"
             ? "accessibility"
             : "synthetic_events",
         delivery: {
           mode:
-            tool === "click" || tool === "set_value" || tool === "invoke_menu"
+            (tool === "click" && arguments_.from_zoom !== true) ||
+            tool === "set_value" ||
+            tool === "invoke_menu"
               ? "not_applicable"
               : this.syntheticDeliveryMode,
         },
@@ -223,6 +434,52 @@ class NativeFixtureDriver implements DriverClient {
       };
     }
     throw new Error(`unexpected fixture tool: ${tool}`);
+  }
+
+  async callWithContent(
+    tool: string,
+    arguments_: Record<string, JsonValue>,
+  ): Promise<DriverCallResult> {
+    this.calls.push({ tool, arguments: structuredClone(arguments_) });
+    if (tool === "get_window_state") {
+      const bytes = visualPng(640, 480, this.visualRevision);
+      return {
+        structuredContent: {
+          pid: this.appPid,
+          window_id: TARGET.windowId,
+          screenshot_frame_valid: true,
+          screenshot_width: 640,
+          screenshot_height: 480,
+          screenshot_mime_type: "image/png",
+        },
+        images: [
+          {
+            type: "image",
+            mimeType: "image/png",
+            data: bytes.toString("base64"),
+          },
+        ],
+      };
+    }
+    if (tool === "zoom") {
+      const bytes = visualJpeg();
+      return {
+        structuredContent: {
+          format: "jpeg",
+          mime_type: "image/jpeg",
+          width: 276,
+          height: 288,
+        },
+        images: [
+          {
+            type: "image",
+            mimeType: "image/jpeg",
+            data: bytes.toString("base64"),
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected fixture content tool: ${tool}`);
   }
 
   async close(): Promise<void> {}
@@ -301,6 +558,207 @@ async function observeFixture(core: NativeComputerUseCore) {
   assert.equal("pid" in window, false);
   return core.observe({ windowRef: window.windowRef });
 }
+
+test("exact stopped app launch is background-only, verified, and at-most-once", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.appRunning = false;
+  driver.appPid = 0;
+  const apps = await core.listApps();
+  const app = apps[0];
+  assert.ok(app);
+  assert.equal(app.running, false);
+  const first = await core.launchApp({
+    appRef: app.appRef,
+    operationKey: "launch-fixture-once",
+  });
+  assert.equal(first.outcome, "verified");
+  assert.equal(first.reasonCode, "app_launched");
+  assert.equal(first.app?.running, true);
+  assert.equal(first.app?.appRef, app.appRef);
+  assert.equal(driver.launchCalls, 1);
+  const launch = driver.calls.find((call) => call.tool === "launch_app");
+  assert.deepEqual(launch?.arguments, { bundle_id: TARGET.bundleId });
+
+  const replay = await core.launchApp({
+    appRef: app.appRef,
+    operationKey: "launch-fixture-once",
+  });
+  assert.deepEqual(replay, first);
+  assert.equal(driver.launchCalls, 1);
+  const windows = await core.listWindows({ appRef: app.appRef });
+  assert.equal(windows.length, 1);
+});
+
+test("visual grid clicks keep coordinates local and require semantic verification", async (t) => {
+  const { core, driver } = await fixture(t);
+  const apps = await core.listApps();
+  const app = apps.find((candidate) => candidate.name === "Fixture App");
+  assert.ok(app);
+  const windows = await core.listWindows({ appRef: app.appRef });
+  const window = windows[0];
+  assert.ok(window);
+
+  const overview = await core.observeVisual({ windowRef: window.windowRef });
+  assert.equal(overview.image.mimeType, "image/png");
+  assert.equal(overview.regions.length, 64);
+  assert.deepEqual(
+    [
+      ...new Set(overview.regions.flatMap((region) => Object.keys(region))),
+    ].sort(),
+    ["id", "label"],
+  );
+  const detail = await core.refineVisual({
+    overviewId: overview.id,
+    regionId: overview.regions[0]!.id,
+  });
+  assert.equal(detail.image.mimeType, "image/jpeg");
+  assert.equal(detail.observation.candidateCount, 64);
+  const cell = detail.observation.candidates[0];
+  assert.ok(cell);
+  assert.equal(cell.targetKind, "visual_cell");
+  assert.equal(cell.riskByAction.click, "r3_consequential");
+  for (const candidate of detail.observation.candidates) {
+    assert.deepEqual(Object.keys(candidate).sort(), [
+      "actionKinds",
+      "enabled",
+      "id",
+      "label",
+      "riskByAction",
+      "role",
+      "selected",
+      "targetKind",
+      "untrustedText",
+      "valuePresent",
+    ]);
+  }
+
+  const result = await executeApproved(core, {
+    operationKey: "visual-click-once",
+    observationId: detail.observation.id,
+    candidateId: cell.id,
+    action: { kind: "click" },
+    verification,
+  });
+  assert.equal(result.outcome, "verified");
+  const click = driver.calls.find(
+    (call) => call.tool === "click" && call.arguments.from_zoom === true,
+  );
+  assert.ok(click);
+  assert.equal(typeof click.arguments.x, "number");
+  assert.equal(typeof click.arguments.y, "number");
+  assert.equal(click.arguments.element_token, undefined);
+  assert.equal(click.arguments.delivery_mode, "background");
+  assert.equal(driver.calls.filter((call) => call.tool === "zoom").length, 2);
+});
+
+test("visual click refuses a changed screenshot before dispatch", async (t) => {
+  const { core, driver } = await fixture(t);
+  const apps = await core.listApps();
+  const app = apps[0];
+  assert.ok(app);
+  const windows = await core.listWindows({ appRef: app.appRef });
+  const window = windows[0];
+  assert.ok(window);
+  const overview = await core.observeVisual({ windowRef: window.windowRef });
+  const detail = await core.refineVisual({
+    overviewId: overview.id,
+    regionId: overview.regions[0]!.id,
+  });
+  driver.visualRevision = 1;
+  const result = await executeApproved(core, {
+    operationKey: "visual-stale-no-click",
+    observationId: detail.observation.id,
+    candidateId: detail.observation.candidates[0]!.id,
+    action: { kind: "click" },
+    verification,
+  });
+  assert.equal(result.outcome, "unknown");
+  assert.equal(result.reasonCode, "stale_observation");
+  assert.equal(result.mutationAttempted, false);
+  assert.equal(
+    driver.calls.some((call) => call.tool === "click"),
+    false,
+  );
+});
+
+test("a visual click is refused when its semantic precondition is unobservable", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.preVerificationStatus = "unknown";
+  const apps = await core.listApps();
+  const windows = await core.listWindows({ appRef: apps[0]!.appRef });
+  const overview = await core.observeVisual({
+    windowRef: windows[0]!.windowRef,
+  });
+  const detail = await core.refineVisual({
+    overviewId: overview.id,
+    regionId: overview.regions[0]!.id,
+  });
+  const result = await executeApproved(core, {
+    operationKey: "visual-no-ax-change",
+    observationId: detail.observation.id,
+    candidateId: detail.observation.candidates[0]!.id,
+    action: { kind: "click" },
+    verification,
+  });
+  assert.equal(result.outcome, "unknown");
+  assert.equal(result.reasonCode, "precondition_unknown");
+  assert.equal(result.mutationAttempted, false);
+  assert.equal(driver.actionCalls, 0);
+});
+
+test("a visual click is refuted when its semantic postcondition is unsatisfied", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.visualChangesAfterClick = false;
+  driver.verificationStatus = "unsatisfied";
+  const apps = await core.listApps();
+  const windows = await core.listWindows({ appRef: apps[0]!.appRef });
+  const overview = await core.observeVisual({
+    windowRef: windows[0]!.windowRef,
+  });
+  const detail = await core.refineVisual({
+    overviewId: overview.id,
+    regionId: overview.regions[0]!.id,
+  });
+  const result = await executeApproved(core, {
+    operationKey: "visual-no-change",
+    observationId: detail.observation.id,
+    candidateId: detail.observation.candidates[0]!.id,
+    action: { kind: "click" },
+    verification,
+  });
+  assert.equal(result.outcome, "refuted");
+  assert.equal(result.reconciliationRequired, true);
+  assert.equal(result.safeToRetry, false);
+});
+
+test("visual pixel change is not accepted as a verification predicate", async (t) => {
+  const { core, driver } = await fixture(t);
+  const apps = await core.listApps();
+  const windows = await core.listWindows({ appRef: apps[0]!.appRef });
+  const overview = await core.observeVisual({
+    windowRef: windows[0]!.windowRef,
+  });
+  const detail = await core.refineVisual({
+    overviewId: overview.id,
+    regionId: overview.regions[0]!.id,
+  });
+
+  await assert.rejects(
+    executeApproved(core, {
+      operationKey: "visual-pixel-change-not-proof",
+      observationId: detail.observation.id,
+      candidateId: detail.observation.candidates[0]!.id,
+      action: { kind: "click" },
+      verification: {
+        expect: [{ visual: { changed: true } }],
+        timeoutMs: 0,
+        stableSamples: 2,
+      } as never,
+    }),
+    /native element predicate is invalid/u,
+  );
+  assert.equal(driver.actionCalls, 0);
+});
 
 test("native core exposes opaque candidates and rebinds immediately before mutation", async (t) => {
   const { core, driver, barrier } = await fixture(t);
@@ -718,7 +1176,7 @@ test("approved set_value stays on Accessibility, verifies the exact bound elemen
     (candidate) => candidate.role === "AXTextField",
   );
   assert.ok(field);
-  assert.deepEqual(field.actionKinds, ["set_value"]);
+  assert.deepEqual(field.actionKinds, ["set_value", "type_text", "press_key"]);
   assert.equal(field.riskByAction.set_value, "r2_private");
   const value = "new-address@example.test";
   const valueVerification = Object.freeze({
@@ -755,6 +1213,213 @@ test("approved set_value stays on Accessibility, verifies the exact bound elemen
   assert.equal(mutation.arguments.value, value);
   assert.doesNotMatch(JSON.stringify(result), /new-address|example\.test/u);
   assert.doesNotMatch(await readFilesRecursively(directory), new RegExp(value));
+});
+
+test("approved type_text stays bound to the freshly observed non-secure text control", async (t) => {
+  const { core, driver, directory } = await fixture(t);
+  const observation = await observeFixture(core);
+  const field = observation.candidates.find(
+    (candidate) => candidate.role === "AXTextField",
+  );
+  assert.ok(field);
+  assert.equal(field.actionKinds.includes("type_text"), true);
+  assert.equal(field.riskByAction.type_text, "r2_private");
+  const text = "bounded fixture text";
+  const typeVerification = Object.freeze({
+    expect: Object.freeze([
+      Object.freeze({
+        element: Object.freeze({
+          selector: Object.freeze({
+            role: "AXTextField",
+            labelContains: "Account email",
+          }),
+          valueEquals: text,
+        }),
+      }),
+    ]),
+    timeoutMs: 0,
+    stableSamples: 2,
+  });
+
+  const result = await executeApproved(core, {
+    operationKey: "type-text-once",
+    observationId: observation.id,
+    candidateId: field.id,
+    action: { kind: "type_text", text },
+    verification: typeVerification,
+  });
+
+  assert.equal(result.outcome, "verified");
+  assert.equal(result.route, "synthetic_events");
+  const mutation = driver.calls.find((call) => call.tool === "type_text");
+  assert.ok(mutation);
+  assert.equal(mutation.arguments.element_token, "private-text-token-2");
+  assert.equal(mutation.arguments.text, text);
+  assert.equal(mutation.arguments.delivery_mode, "background");
+  assert.doesNotMatch(await readFilesRecursively(directory), new RegExp(text));
+});
+
+test("type_text cannot use an unrelated postcondition as proof of insertion", async (t) => {
+  const { core, driver } = await fixture(t);
+  const observation = await observeFixture(core);
+  const field = observation.candidates.find(
+    (candidate) => candidate.role === "AXTextField",
+  );
+  assert.ok(field);
+  const result = await executeApproved(core, {
+    operationKey: "type-text-unrelated-proof",
+    observationId: observation.id,
+    candidateId: field.id,
+    action: { kind: "type_text", text: "must not dispatch" },
+    verification,
+  });
+  assert.equal(result.outcome, "denied");
+  assert.equal(result.reasonCode, "verification_mismatch");
+  assert.equal(result.mutationAttempted, false);
+  assert.equal(driver.actionCalls, 0);
+});
+
+test("window and eligible controls expose only approval-aware bounded key delivery", async (t) => {
+  const { core, driver } = await fixture(t);
+  const observation = await observeFixture(core);
+  const window = observation.candidates.find(
+    (candidate) => candidate.targetKind === "window",
+  );
+  const field = observation.candidates.find(
+    (candidate) => candidate.role === "AXTextField",
+  );
+  assert.ok(window);
+  assert.ok(field);
+  assert.equal(window.actionKinds.includes("press_key"), true);
+  assert.equal(window.riskByAction.press_key, "r1_reversible");
+  assert.equal(field.actionKinds.includes("press_key"), true);
+
+  const result = await core.execute({
+    operationKey: "press-safe-key",
+    observationId: observation.id,
+    candidateId: window.id,
+    action: { kind: "press_key", key: "escape" },
+    verification,
+  });
+
+  assert.equal(result.outcome, "verified");
+  const mutation = driver.calls.find((call) => call.tool === "press_key");
+  assert.ok(mutation);
+  assert.equal(mutation.arguments.key, "escape");
+  assert.equal(mutation.arguments.element_token, undefined);
+  assert.equal(mutation.arguments.delivery_mode, "background");
+});
+
+test("exact menu paths remain local, exclude unsafe branches, and cannot be caller-substituted", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.includeMenuTree = true;
+  const observation = await observeFixture(core);
+  const menuItem = observation.candidates.find(
+    (candidate) => candidate.label === "View > Show Sidebar",
+  );
+  assert.ok(menuItem);
+  assert.deepEqual(menuItem.actionKinds, ["invoke_menu"]);
+  assert.equal(menuItem.riskByAction.invoke_menu, "r3_consequential");
+  assert.equal(menuItem.label, "View > Show Sidebar");
+  assert.equal(
+    observation.candidates.some(
+      (candidate) =>
+        candidate.label === "Shut Down\u2026" || candidate.label === "Services",
+    ),
+    false,
+  );
+  assert.equal("path" in menuItem, false);
+
+  await assert.rejects(
+    core.execute({
+      operationKey: "caller-path-must-not-win",
+      observationId: observation.id,
+      candidateId: menuItem.id,
+      action: {
+        kind: "invoke_menu",
+        path: ["File", "Delete"],
+      } as never,
+      verification,
+    }),
+    /native menu path is invalid/u,
+  );
+  assert.equal(driver.actionCalls, 0);
+
+  const result = await executeApproved(core, {
+    operationKey: "invoke-exact-menu",
+    observationId: observation.id,
+    candidateId: menuItem.id,
+    action: { kind: "invoke_menu" },
+    verification,
+  });
+  assert.equal(result.outcome, "verified");
+  const mutation = driver.calls.find((call) => call.tool === "invoke_menu");
+  assert.ok(mutation);
+  assert.deepEqual(mutation.arguments.path, ["View", "Show Sidebar"]);
+  assert.equal(mutation.arguments.element_token, undefined);
+});
+
+test("the application menu is omitted structurally despite an inventory-name mismatch", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.includeMenuTree = true;
+  driver.appMenuRootLabel = "Localized Alias";
+  const observation = await observeFixture(core);
+  assert.equal(
+    observation.candidates.some(
+      (candidate) => candidate.label === "Localized Alias > Beenden",
+    ),
+    false,
+  );
+  assert.equal(
+    observation.candidates.some(
+      (candidate) => candidate.label === "View > Show Sidebar",
+    ),
+    true,
+  );
+});
+
+test("menu invocation refuses a changed ancestor path before dispatch", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.includeMenuTree = true;
+  const observation = await observeFixture(core);
+  const menuItem = observation.candidates.find(
+    (candidate) => candidate.label === "View > Show Sidebar",
+  );
+  assert.ok(menuItem);
+  driver.menuRootLabel = "Format";
+
+  const result = await executeApproved(core, {
+    operationKey: "stale-menu-path",
+    observationId: observation.id,
+    candidateId: menuItem.id,
+    action: { kind: "invoke_menu" },
+    verification,
+  });
+  assert.equal(result.reasonCode, "stale_observation");
+  assert.equal(result.mutationAttempted, false);
+  assert.equal(driver.actionCalls, 0);
+});
+
+test("menu invocation refuses a path that becomes ambiguous before dispatch", async (t) => {
+  const { core, driver } = await fixture(t);
+  driver.includeMenuTree = true;
+  const observation = await observeFixture(core);
+  const menuItem = observation.candidates.find(
+    (candidate) => candidate.label === "View > Show Sidebar",
+  );
+  assert.ok(menuItem);
+  driver.duplicateMenuLeaf = true;
+
+  const result = await executeApproved(core, {
+    operationKey: "ambiguous-menu-path",
+    observationId: observation.id,
+    candidateId: menuItem.id,
+    action: { kind: "invoke_menu" },
+    verification,
+  });
+  assert.equal(result.reasonCode, "stale_observation");
+  assert.equal(result.mutationAttempted, false);
+  assert.equal(driver.actionCalls, 0);
 });
 
 test("set_value approval is consumed when the field changes during consent", async (t) => {

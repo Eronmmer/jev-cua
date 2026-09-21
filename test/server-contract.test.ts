@@ -20,8 +20,11 @@ test("native MCP tools advertise bounded object output schemas and the reviewed 
   const tools = (await client.listTools()).tools;
   const names = [
     "jev_cua_native_start",
+    "jev_cua_native_launch_app",
     "jev_cua_native_list_windows",
     "jev_cua_native_observe",
+    "jev_cua_native_visual_observe",
+    "jev_cua_native_visual_refine",
     "jev_cua_native_step",
     "jev_cua_native_end",
   ];
@@ -44,5 +47,28 @@ test("native MCP tools advertise bounded object output schemas and the reviewed 
   const serialized = JSON.stringify(step.inputSchema);
   assert.match(serialized, /label_contains/u);
   assert.match(serialized, /value_equals/u);
+  assert.doesNotMatch(serialized, /"kind":\{"const":"visual"\}/u);
   assert.doesNotMatch(serialized, /"kind":\{"const":"window"\}/u);
+
+  const visualObserve = tools.find(
+    (candidate) => candidate.name === "jev_cua_native_visual_observe",
+  );
+  const visualRefine = tools.find(
+    (candidate) => candidate.name === "jev_cua_native_visual_refine",
+  );
+  assert.ok(visualObserve);
+  assert.ok(visualRefine);
+  assert.match(
+    JSON.stringify(visualObserve.outputSchema),
+    /approval_required/u,
+  );
+  const visualInputs = JSON.stringify([
+    visualObserve.inputSchema,
+    visualRefine.inputSchema,
+  ]);
+  assert.doesNotMatch(
+    visualInputs,
+    /\b(?:x|y|x1|x2|y1|y2|coordinate|pid|window_id)\b/u,
+  );
+  assert.match(JSON.stringify(visualRefine.outputSchema), /visual_cell/u);
 });

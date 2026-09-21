@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 
 import type { RiskClass } from "../types.js";
+import type { DriverImageContent } from "../types.js";
 import { AsyncMutex, randomOpaqueId } from "../util.js";
 import type {
   NativeAction,
@@ -11,8 +12,11 @@ import type {
   NativeCandidate,
   NativeEndResult,
   NativeExecutionResult,
+  NativeLaunchResult,
   NativeObservation,
   NativeVerification,
+  NativeVisualDetail,
+  NativeVisualOverview,
   NativeWindowSummary,
   NativeWindowTarget,
 } from "./types.js";
@@ -36,13 +40,43 @@ const SAFE_SCROLLS = Object.freeze([
     description: "Scroll down 3 lines",
   }),
 ]);
+const SAFE_KEYS = Object.freeze([
+  Object.freeze({ key: "escape", description: "Press Escape" }),
+  Object.freeze({ key: "tab", description: "Press Tab" }),
+  Object.freeze({ key: "up", description: "Press Up Arrow" }),
+  Object.freeze({ key: "down", description: "Press Down Arrow" }),
+  Object.freeze({ key: "left", description: "Press Left Arrow" }),
+  Object.freeze({ key: "right", description: "Press Right Arrow" }),
+  Object.freeze({ key: "home", description: "Press Home" }),
+  Object.freeze({ key: "end", description: "Press End" }),
+  Object.freeze({ key: "pageup", description: "Press Page Up" }),
+  Object.freeze({ key: "pagedown", description: "Press Page Down" }),
+]);
+const APPROVAL_KEYS = Object.freeze([
+  Object.freeze({ key: "return", description: "Press Return" }),
+  Object.freeze({ key: "space", description: "Press Space" }),
+  Object.freeze({ key: "delete", description: "Press Delete" }),
+]);
 
 export interface NativeCoreFacade {
   listApps(): Promise<readonly NativeAppSummary[]>;
+  launchApp?(
+    input: Readonly<{
+      appRef: string;
+      operationKey: string;
+    }>,
+  ): Promise<NativeLaunchResult>;
   listWindows(
     input: Readonly<{ appRef: string }>,
   ): Promise<readonly NativeWindowSummary[]>;
   observe(target: NativeWindowTarget): Promise<NativeObservation>;
+  observeVisual?(target: NativeWindowTarget): Promise<NativeVisualOverview>;
+  refineVisual?(
+    input: Readonly<{
+      overviewId: string;
+      regionId: string;
+    }>,
+  ): Promise<NativeVisualDetail>;
   execute(
     input: Readonly<{
       operationKey: string;
@@ -62,6 +96,7 @@ export type NativePublicApp = Readonly<{
   name: string;
   running: boolean;
   active: boolean;
+  launchable: boolean;
   untrustedText: true;
 }>;
 
@@ -91,7 +126,7 @@ export type NativePublicAction = Readonly<{
 
 export type NativePublicCandidate = Readonly<{
   candidateRef: string;
-  targetKind: "window" | "element";
+  targetKind: "window" | "element" | "visual_cell";
   role: string;
   label?: string;
   valuePresent: boolean;
@@ -116,12 +151,45 @@ export type NativeStartResult = Readonly<{
   apps: readonly NativePublicApp[];
 }>;
 
+export type NativePublicLaunchResult = Readonly<{
+  outcome: NativeLaunchResult["outcome"];
+  reasonCode: NativeLaunchResult["reasonCode"];
+  app?: NativePublicApp;
+  mutationAttempted: boolean;
+  reconciliationRequired: boolean;
+  safeToRetry: boolean;
+  replayed: boolean;
+}>;
+
+export type NativePublicVisualOverview = Readonly<{
+  visualObservationRef: string;
+  windowRef: string;
+  width: number;
+  height: number;
+  image: DriverImageContent;
+  regions: readonly Readonly<{ regionRef: string; label: string }>[];
+}>;
+
+export type NativePublicVisualDetail = Readonly<{
+  observation: NativePublicObservation;
+  width: number;
+  height: number;
+  image: DriverImageContent;
+}>;
+
+export type NativeVisualDisclosureContext = Readonly<{
+  appLabel: string;
+  windowLabel: string;
+  untrustedUiData: true;
+}>;
+
 export type NativeApprovalContext = Readonly<{
   runRef: string;
   observationRef: string;
   actionRef: string;
   operationFingerprint: string;
-  actionKind: "click" | "set_value";
+  actionKind: NativeActionKind;
+  actionDescription: string;
   risk: "r2_private" | "r3_consequential";
   appLabel: string;
   windowLabel: string;
@@ -135,7 +203,13 @@ export type NativeApprovalHandler = (
   context: NativeApprovalContext,
 ) => Promise<NativeApprovalDecision> | NativeApprovalDecision;
 
-type AppBinding = Readonly<{ coreAppRef: string; name: string }>;
+type AppBinding = Readonly<{
+  coreAppRef: string;
+  name: string;
+  running: boolean;
+  active: boolean;
+  launchable: boolean;
+}>;
 type WindowBinding = Readonly<{
   publicAppRef: string;
   coreWindowRef: string;
@@ -143,18 +217,24 @@ type WindowBinding = Readonly<{
 }>;
 type BoundAction =
   | Readonly<{ source: "fixed"; value: NativeAction }>
-  | Readonly<{ source: "text"; kind: "set_value" }>;
+  | Readonly<{ source: "text"; kind: "set_value" | "type_text" }>;
 type ActionBinding = Readonly<{
   observationRef: string;
   coreObservationId: string;
   coreCandidateId: string;
   action: BoundAction;
+  actionDescription: string;
   risk: RiskClass;
   availability: "allowed" | "approval_required";
   appLabel: string;
   windowLabel: string;
   controlRole: string;
   controlLabel?: string;
+}>;
+type VisualOverviewBinding = Readonly<{
+  windowRef: string;
+  coreOverviewId: string;
+  regions: ReadonlyMap<string, string>;
 }>;
 
 type ActiveRun = {
@@ -164,6 +244,7 @@ type ActiveRun = {
   readonly windows: Map<string, WindowBinding>;
   readonly observations: Set<string>;
   readonly actions: Map<string, ActionBinding>;
+  readonly visualOverviews: Map<string, VisualOverviewBinding>;
   idleTimer?: ReturnType<typeof setTimeout>;
 };
 
@@ -271,28 +352,99 @@ export class NativeRunManager {
         windows: new Map(),
         observations: new Set(),
         actions: new Map(),
+        visualOverviews: new Map(),
       };
       const apps = Object.freeze(
-        coreApps
-          .filter((app) => app.running)
-          .map((app): NativePublicApp => {
-            const appRef = randomOpaqueId("napp");
-            active.apps.set(
-              appRef,
-              Object.freeze({ coreAppRef: app.appRef, name: app.name }),
-            );
-            return Object.freeze({
-              appRef,
+        coreApps.map((app): NativePublicApp => {
+          const appRef = randomOpaqueId("napp");
+          active.apps.set(
+            appRef,
+            Object.freeze({
+              coreAppRef: app.appRef,
               name: app.name,
               running: app.running,
               active: app.active,
-              untrustedText: true,
-            });
-          }),
+              launchable: app.launchable,
+            }),
+          );
+          return Object.freeze({
+            appRef,
+            name: app.name,
+            running: app.running,
+            active: app.active,
+            launchable: app.launchable,
+            untrustedText: true,
+          });
+        }),
       );
       this.active = active;
       this.touch(active);
       return Object.freeze({ runRef, apps });
+    });
+  }
+
+  async launchApp(
+    input: Readonly<{
+      runRef: string;
+      appRef: string;
+      operationKey: string;
+    }>,
+  ): Promise<NativePublicLaunchResult> {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input.runRef);
+      const binding = active.apps.get(input.appRef);
+      if (!binding) throw new Error("native app reference is stale or invalid");
+      if (!active.core.launchApp)
+        throw new Error("native app launch is unavailable");
+      let result: NativeLaunchResult;
+      try {
+        result = await active.core.launchApp({
+          appRef: binding.coreAppRef,
+          operationKey: input.operationKey,
+        });
+      } catch {
+        result = Object.freeze({
+          outcome: "unknown",
+          reasonCode: "reconciliation_required",
+          mutationAttempted: true,
+          reconciliationRequired: true,
+          safeToRetry: false,
+          replayed: false,
+        });
+        await active.core.quarantine().catch(() => undefined);
+      }
+      let app: NativePublicApp | undefined;
+      if (result.app) {
+        active.apps.set(
+          input.appRef,
+          Object.freeze({
+            coreAppRef: result.app.appRef,
+            name: result.app.name,
+            running: result.app.running,
+            active: result.app.active,
+            launchable: result.app.launchable,
+          }),
+        );
+        app = Object.freeze({
+          appRef: input.appRef,
+          name: result.app.name,
+          running: result.app.running,
+          active: result.app.active,
+          launchable: result.app.launchable,
+          untrustedText: true,
+        });
+      }
+      this.clearWindowCapabilities(active);
+      this.touch(active);
+      return Object.freeze({
+        outcome: result.outcome,
+        reasonCode: result.reasonCode,
+        ...(app ? { app } : {}),
+        mutationAttempted: result.mutationAttempted,
+        reconciliationRequired: result.reconciliationRequired,
+        safeToRetry: result.safeToRetry,
+        replayed: result.replayed,
+      });
     });
   }
 
@@ -303,6 +455,8 @@ export class NativeRunManager {
       const active = this.requireRun(input.runRef);
       const app = active.apps.get(input.appRef);
       if (!app) throw new Error("native app reference is stale or invalid");
+      if (!app.running)
+        throw new Error("native app is stopped and must be launched first");
       let coreWindows: readonly NativeWindowSummary[];
       try {
         coreWindows = await active.core.listWindows({
@@ -366,6 +520,114 @@ export class NativeRunManager {
     });
   }
 
+  async observeVisual(
+    input: Readonly<{ runRef: string; windowRef: string }>,
+  ): Promise<NativePublicVisualOverview> {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input.runRef);
+      const window = active.windows.get(input.windowRef);
+      if (!window)
+        throw new Error("native window reference is stale or invalid");
+      let overview: NativeVisualOverview;
+      try {
+        if (!active.core.observeVisual)
+          throw new Error("native visual observation is unavailable");
+        overview = await active.core.observeVisual({
+          windowRef: window.coreWindowRef,
+        });
+      } catch {
+        throw new Error("native window screenshot could not be observed");
+      }
+      this.clearObservationCapabilities(active);
+      const visualObservationRef = randomOpaqueId("nvobs");
+      const regionBindings = new Map<string, string>();
+      const regions = Object.freeze(
+        overview.regions.map((region) => {
+          const regionRef = randomOpaqueId("nvreg");
+          regionBindings.set(regionRef, region.id);
+          return Object.freeze({ regionRef, label: region.label });
+        }),
+      );
+      active.visualOverviews.set(
+        visualObservationRef,
+        Object.freeze({
+          windowRef: input.windowRef,
+          coreOverviewId: overview.id,
+          regions: regionBindings,
+        }),
+      );
+      this.touch(active);
+      return Object.freeze({
+        visualObservationRef,
+        windowRef: input.windowRef,
+        width: overview.width,
+        height: overview.height,
+        image: overview.image,
+        regions,
+      });
+    });
+  }
+
+  async visualDisclosureContext(
+    input: Readonly<{ runRef: string; windowRef: string }>,
+  ): Promise<NativeVisualDisclosureContext> {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input.runRef);
+      const window = active.windows.get(input.windowRef);
+      const app = window ? active.apps.get(window.publicAppRef) : undefined;
+      if (!window || !app)
+        throw new Error("native window reference is stale or invalid");
+      this.touch(active);
+      return Object.freeze({
+        appLabel: app.name,
+        windowLabel: window.title,
+        untrustedUiData: true,
+      });
+    });
+  }
+
+  async refineVisual(
+    input: Readonly<{
+      runRef: string;
+      visualObservationRef: string;
+      regionRef: string;
+    }>,
+  ): Promise<NativePublicVisualDetail> {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input.runRef);
+      const binding = active.visualOverviews.get(input.visualObservationRef);
+      const coreRegionId = binding?.regions.get(input.regionRef);
+      if (!binding || !coreRegionId)
+        throw new Error(
+          "native visual observation capability is stale or invalid",
+        );
+      let detail: NativeVisualDetail;
+      try {
+        if (!active.core.refineVisual)
+          throw new Error("native visual refinement is unavailable");
+        detail = await active.core.refineVisual({
+          overviewId: binding.coreOverviewId,
+          regionId: coreRegionId,
+        });
+      } catch {
+        throw new Error("native visual observation is stale or unavailable");
+      }
+      this.clearObservationCapabilities(active);
+      const observation = this.publishObservation(
+        active,
+        binding.windowRef,
+        detail.observation,
+      );
+      this.touch(active);
+      return Object.freeze({
+        observation,
+        width: detail.width,
+        height: detail.height,
+        image: detail.image,
+      });
+    });
+  }
+
   async step(
     input: Readonly<{
       runRef: string;
@@ -419,13 +681,18 @@ export class NativeRunManager {
           containsRecognizableCredential(input.text)
         ) {
           throw new Error(
-            "native set-value action requires one to 4000 characters of non-sensitive text and rejects recognizable credentials",
+            "native text action requires one to 4000 characters of non-sensitive text and rejects recognizable credentials",
           );
         }
-        action = Object.freeze({ kind: "set_value", value: input.text });
+        action =
+          binding.action.kind === "set_value"
+            ? Object.freeze({ kind: "set_value", value: input.text })
+            : Object.freeze({ kind: "type_text", text: input.text });
       } else {
         if (input.text !== undefined)
-          throw new Error("native text is valid only for a set-value action");
+          throw new Error(
+            "native text is valid only for a returned text-entry action",
+          );
         action = binding.action.value;
       }
       const operationFingerprint = createHmac(
@@ -444,8 +711,7 @@ export class NativeRunManager {
                 request.actionKind !== action.kind ||
                 request.risk !== binding.risk ||
                 (request.risk !== "r2_private" &&
-                  request.risk !== "r3_consequential") ||
-                (action.kind !== "click" && action.kind !== "set_value")
+                  request.risk !== "r3_consequential")
               ) {
                 return Object.freeze({ status: "failed" as const });
               }
@@ -456,6 +722,7 @@ export class NativeRunManager {
                   actionRef: input.actionRef,
                   operationFingerprint,
                   actionKind: action.kind,
+                  actionDescription: binding.actionDescription,
                   risk: request.risk,
                   appLabel: binding.appLabel,
                   windowLabel: binding.windowLabel,
@@ -465,7 +732,9 @@ export class NativeRunManager {
                     : { controlLabel: binding.controlLabel }),
                   ...(action.kind === "set_value"
                     ? { text: action.value }
-                    : {}),
+                    : action.kind === "type_text"
+                      ? { text: action.text }
+                      : {}),
                   untrustedUiData: true,
                 }),
               );
@@ -624,6 +893,7 @@ export class NativeRunManager {
           coreObservationId: observation.id,
           coreCandidateId: candidate.id,
           action: Object.freeze(action),
+          actionDescription: description,
           risk,
           availability,
           appLabel: app.name,
@@ -647,14 +917,23 @@ export class NativeRunManager {
 
     if (candidate.actionKinds.includes("click")) {
       const risk = candidate.riskByAction.click ?? "r4_forbidden";
-      if (candidate.targetKind === "element" && risk !== "r4_forbidden") {
+      if (
+        (candidate.targetKind === "element" ||
+          candidate.targetKind === "visual_cell") &&
+        risk !== "r4_forbidden"
+      ) {
         bind(
           Object.freeze({
             source: "fixed",
-            value: Object.freeze({ kind: "click", activation: "press" }),
+            value:
+              candidate.targetKind === "visual_cell"
+                ? Object.freeze({ kind: "click" })
+                : Object.freeze({ kind: "click", activation: "press" }),
           }),
           "click",
-          "Press this control",
+          candidate.targetKind === "visual_cell"
+            ? `Click visual grid cell ${candidate.label ?? ""}`.trim()
+            : "Press this control",
           risk,
           risk === "r0_read_only" || risk === "r1_reversible"
             ? "allowed"
@@ -698,14 +977,96 @@ export class NativeRunManager {
 
     if (candidate.actionKinds.includes("type_text")) {
       const risk = candidate.riskByAction.type_text ?? "r2_private";
-      actions.push(
-        unavailableAction(
+      if (candidate.targetKind === "element" && risk !== "r4_forbidden") {
+        bind(
+          Object.freeze({ source: "text", kind: "type_text" }),
           "type_text",
-          "Synthetic text entry is not exposed",
+          "Type non-sensitive text in this control",
           risk,
-          risk === "r4_forbidden" ? "denied" : "not_exposed",
-        ),
-      );
+          risk === "r0_read_only" || risk === "r1_reversible"
+            ? "allowed"
+            : "approval_required",
+        );
+      } else {
+        actions.push(
+          unavailableAction(
+            "type_text",
+            "Type non-sensitive text in this control",
+            risk,
+            unavailableForRisk(risk),
+          ),
+        );
+      }
+    }
+
+    if (candidate.actionKinds.includes("press_key")) {
+      const risk = candidate.riskByAction.press_key ?? "r4_forbidden";
+      if (risk !== "r4_forbidden") {
+        for (const key of SAFE_KEYS) {
+          bind(
+            Object.freeze({
+              source: "fixed",
+              value: Object.freeze({ kind: "press_key", key: key.key }),
+            }),
+            "press_key",
+            key.description,
+            risk,
+            risk === "r0_read_only" || risk === "r1_reversible"
+              ? "allowed"
+              : "approval_required",
+          );
+        }
+        for (const key of APPROVAL_KEYS) {
+          const keyRisk: RiskClass =
+            risk === "r3_consequential" ? risk : "r2_private";
+          bind(
+            Object.freeze({
+              source: "fixed",
+              value: Object.freeze({ kind: "press_key", key: key.key }),
+            }),
+            "press_key",
+            key.description,
+            keyRisk,
+            "approval_required",
+          );
+        }
+      } else {
+        actions.push(
+          unavailableAction(
+            "press_key",
+            "Press a navigation key",
+            risk,
+            "denied",
+          ),
+        );
+      }
+    }
+
+    if (candidate.actionKinds.includes("invoke_menu")) {
+      const risk = candidate.riskByAction.invoke_menu ?? "r4_forbidden";
+      if (candidate.targetKind === "element" && risk !== "r4_forbidden") {
+        bind(
+          Object.freeze({
+            source: "fixed",
+            value: Object.freeze({ kind: "invoke_menu" }),
+          }),
+          "invoke_menu",
+          "Choose this exact menu item",
+          risk,
+          risk === "r0_read_only" || risk === "r1_reversible"
+            ? "allowed"
+            : "approval_required",
+        );
+      } else {
+        actions.push(
+          unavailableAction(
+            "invoke_menu",
+            "Choose this exact menu item",
+            risk,
+            unavailableForRisk(risk),
+          ),
+        );
+      }
     }
 
     if (candidate.targetKind === "window") {
@@ -769,6 +1130,7 @@ export class NativeRunManager {
   private clearObservationCapabilities(active: ActiveRun): void {
     active.actions.clear();
     active.observations.clear();
+    active.visualOverviews.clear();
   }
 
   private clearWindowCapabilities(active: ActiveRun): void {

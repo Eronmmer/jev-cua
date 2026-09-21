@@ -1,4 +1,5 @@
 import type { RiskClass } from "../types.js";
+import type { DriverImageContent } from "../types.js";
 
 export type NativeWindowTarget = Readonly<{ windowRef: string }>;
 
@@ -8,6 +9,7 @@ export type NativeAppSummary = Readonly<{
   name: string;
   running: boolean;
   active: boolean;
+  launchable: boolean;
   untrustedText: true;
 }>;
 
@@ -31,7 +33,7 @@ export type NativeActionKind =
 
 export type NativeCandidate = Readonly<{
   id: string;
-  targetKind: "window" | "element";
+  targetKind: "window" | "element" | "visual_cell";
   role: string;
   label?: string;
   valuePresent: boolean;
@@ -40,6 +42,43 @@ export type NativeCandidate = Readonly<{
   actionKinds: readonly NativeActionKind[];
   riskByAction: Readonly<Partial<Record<NativeActionKind, RiskClass>>>;
   untrustedText: true;
+}>;
+
+export type NativeVisualRegion = Readonly<{
+  id: string;
+  label: string;
+}>;
+
+export type NativeVisualOverview = Readonly<{
+  id: string;
+  target: NativeWindowTarget;
+  width: number;
+  height: number;
+  image: DriverImageContent;
+  regions: readonly NativeVisualRegion[];
+}>;
+
+export type NativeVisualDetail = Readonly<{
+  observation: NativeObservation;
+  width: number;
+  height: number;
+  image: DriverImageContent;
+}>;
+
+export type NativeLaunchResult = Readonly<{
+  outcome: "verified" | "unknown" | "denied";
+  reasonCode:
+    | "app_launched"
+    | "app_already_running"
+    | "stale_app"
+    | "ambiguous_dispatch"
+    | "reconciliation_required"
+    | "idempotent_replay";
+  app?: NativeAppSummary;
+  mutationAttempted: boolean;
+  reconciliationRequired: boolean;
+  safeToRetry: boolean;
+  replayed: boolean;
 }>;
 
 export type NativeObservation = Readonly<{
@@ -83,7 +122,7 @@ export type NativeAction =
       by?: "line" | "page";
       amount?: number;
     }>
-  | Readonly<{ kind: "invoke_menu"; path: readonly string[] }>;
+  | Readonly<{ kind: "invoke_menu" }>;
 
 export type NativeElementVerification = Readonly<{
   selector: Readonly<{
@@ -138,6 +177,7 @@ export type NativeExecutionResult = Readonly<{
     | "verified"
     | "verification_unsatisfied"
     | "verification_unknown"
+    | "verification_mismatch"
     | "precondition_already_satisfied"
     | "precondition_unknown"
     | "approval_required"

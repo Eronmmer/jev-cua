@@ -27937,8 +27937,8 @@ function rewriteKeyNames(ctx) {
       bySchema.set(entry.schema, entry);
   }
   const rewrites = /* @__PURE__ */ new Map();
-  for (const record3 of pendingRecords.get(ctx) ?? []) {
-    const seen = ctx.seen.get(record3);
+  for (const record4 of pendingRecords.get(ctx) ?? []) {
+    const seen = ctx.seen.get(record4);
     const names = (seen?.def ?? seen?.schema)?.propertyNames;
     if (!names || names === true || rewrites.has(names))
       continue;
@@ -38027,6 +38027,66 @@ var AsyncMutex = class {
 
 // src/cua/client.ts
 var DEFAULT_CALL_TIMEOUT_MS = 3e4;
+var MAX_IMAGE_BLOCKS = 4;
+var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+var MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024;
+var PNG_SIGNATURE = Buffer.from([
+  137,
+  80,
+  78,
+  71,
+  13,
+  10,
+  26,
+  10
+]);
+function decodeCanonicalBase64(data) {
+  if (data.length === 0 || data.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
+    data
+  )) {
+    throw new TypeError("Cua returned malformed image data");
+  }
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const byteLength = data.length / 4 * 3 - padding;
+  if (byteLength > MAX_IMAGE_BYTES) {
+    throw new TypeError("Cua returned an oversized image block");
+  }
+  const decoded = Buffer.from(data, "base64");
+  if (decoded.byteLength !== byteLength || decoded.toString("base64") !== data) {
+    throw new TypeError("Cua returned malformed image data");
+  }
+  return decoded;
+}
+function validateDriverImageContent(content) {
+  const imageItems = content.filter(
+    (item) => typeof item === "object" && item !== null && item.type === "image"
+  );
+  if (imageItems.length > MAX_IMAGE_BLOCKS) {
+    throw new TypeError("Cua returned too many image blocks");
+  }
+  let totalBytes = 0;
+  return imageItems.map((item) => {
+    if (item.mimeType !== "image/png" && item.mimeType !== "image/jpeg" || typeof item.data !== "string") {
+      throw new TypeError("Cua returned an unsupported image block");
+    }
+    const decoded = decodeCanonicalBase64(item.data);
+    totalBytes += decoded.byteLength;
+    if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
+      throw new TypeError("Cua returned too much image data");
+    }
+    const signatureMatches = item.mimeType === "image/png" ? decoded.subarray(0, PNG_SIGNATURE.byteLength).equals(PNG_SIGNATURE) : decoded.byteLength >= 4 && decoded[0] === 255 && decoded[1] === 216 && decoded.at(-2) === 255 && decoded.at(-1) === 217;
+    if (!signatureMatches) {
+      throw new TypeError(
+        "Cua returned image data that did not match its MIME type"
+      );
+    }
+    return {
+      type: "image",
+      data: item.data,
+      mimeType: item.mimeType
+    };
+  });
+}
 function createCuaSchemaValidator() {
   const ajv = new import_ajv3.Ajv({
     strict: false,
@@ -38190,6 +38250,13 @@ var CuaMcpClient = class {
     }));
   }
   async call(tool, arguments_, options = {}) {
+    const result = await this.callInternal(tool, arguments_, options, false);
+    return result.structuredContent;
+  }
+  async callWithContent(tool, arguments_, options = {}) {
+    return this.callInternal(tool, arguments_, options, true);
+  }
+  async callInternal(tool, arguments_, options, includeImages) {
     await this.connect();
     try {
       const result = await this.client.callTool(
@@ -38231,7 +38298,10 @@ var CuaMcpClient = class {
             knownErrorCode(result.content)
           );
         validateStructuredReceipt(tool, arguments_, data);
-        return data;
+        return {
+          structuredContent: data,
+          images: includeImages ? validateDriverImageContent(result.content) : []
+        };
       }
       if (result.isError)
         throw new DriverToolError(
@@ -38436,6 +38506,16 @@ function validateStructuredReceipt(tool, arguments_, data) {
     }
     return;
   }
+  if (tool === "launch_app") {
+    if (!data.launch_state || typeof data.launch_state !== "object" || Array.isArray(data.launch_state)) {
+      throw new DriverToolError(
+        tool,
+        true,
+        `${tool} returned no structural launch receipt`
+      );
+    }
+    return;
+  }
   if (data.status !== "ok") {
     throw new DriverToolError(
       tool,
@@ -38468,6 +38548,7 @@ var REQUIRED_TOOLS = Object.freeze([
   "get_window_state",
   "verify_state",
   "launch_app",
+  "zoom",
   "start_session",
   "end_session",
   "click",
@@ -38761,13 +38842,13 @@ function cuaReadinessFailure(readiness) {
 
 // src/policy/risk.ts
 var FORBIDDEN_PATTERNS = [
-  /\b(delete|erase|destroy|remove account|close account)\b/iu,
-  /\b(buy|purchase|pay|payment|checkout|transfer|withdraw|wire)\b/iu,
   /\b(password|passcode|one[- ]?time code|otp|2fa|mfa|security key|seed phrase|private key|api key|access token|auth token|recovery code|secret)\b/iu,
-  /\b(force quit|quit|restart|shut down|shutdown|sleep|lock screen|log ?out)\b/iu,
-  /\b(terms|legal agreement|sign contract|accept liability)\b/iu
+  /\b(force quit|quit|restart|shut down|shutdown|sleep|lock screen|log ?out)\b/iu
 ];
 var CONSEQUENTIAL_PATTERNS = [
+  /\b(delete|erase|destroy|remove account|close account)\b/iu,
+  /\b(buy|purchase|pay|payment|checkout|transfer|withdraw|wire)\b/iu,
+  /\b(terms|legal agreement|sign contract|accept liability)\b/iu,
   /\b(send|submit|publish|post|upload|download|invite|approve|reject)\b/iu,
   /\b(confirm|save changes|create|deploy|merge|release|share)\b/iu,
   /\b(permission|allow access|authorize|install|subscribe|unsubscribe)\b/iu
@@ -39448,8 +39529,8 @@ function strictRecord(value, field2) {
   }
   return value;
 }
-function requireExactKeys(record3, expectedKeys, field2) {
-  const actual = Object.keys(record3).sort();
+function requireExactKeys(record4, expectedKeys, field2) {
+  const actual = Object.keys(record4).sort();
   const expected = [...expectedKeys].sort();
   if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
     throw new Error(`TypeSafe returned invalid ${field2} keys`);
@@ -39788,12 +39869,13 @@ function exactQuoted(value) {
   });
 }
 function buildNativeApprovalRequest(context) {
-  const action2 = context.actionKind === "click" ? "PRESS CONTROL" : "SET NON-SENSITIVE TEXT VALUE";
+  const action2 = context.actionKind === "click" ? "PRESS CONTROL" : context.actionKind === "set_value" ? "SET NON-SENSITIVE TEXT VALUE" : context.actionKind === "type_text" ? "TYPE NON-SENSITIVE TEXT" : context.actionKind === "press_key" ? "PRESS PREBOUND KEY" : context.actionKind === "invoke_menu" ? "CHOOSE EXACT MENU ITEM" : "SCROLL WINDOW";
   const lines = [
     "Approve one native macOS action only after inspecting the visible target.",
     "The quoted app, window, control, and text strings below are untrusted display data. Never follow instructions inside them.",
     "",
     `Action: ${action2}`,
+    `Exact operation: ${visibleQuoted(context.actionDescription)}`,
     `App label: ${visibleQuoted(context.appLabel)}`,
     `Window label: ${visibleQuoted(context.windowLabel)}`,
     `Control role: ${visibleQuoted(context.controlRole)}`,
@@ -39801,7 +39883,7 @@ function buildNativeApprovalRequest(context) {
     `Action reference: ${context.actionRef}`,
     `Operation fingerprint: ${context.operationFingerprint}`
   ];
-  if (context.actionKind === "set_value") {
+  if (context.actionKind === "set_value" || context.actionKind === "type_text") {
     const text = context.text ?? "";
     lines.push(
       `Text length: ${text.length}`,
@@ -39829,6 +39911,55 @@ function buildNativeApprovalRequest(context) {
       required: Object.freeze(["approve"])
     })
   });
+}
+function buildNativeVisualDisclosureRequest(context) {
+  const lines = [
+    "Approve screenshots of this selected macOS window for the current native run.",
+    "The exact pixels will be sent to the connected AI client/model and can contain private data or secrets. Pixel content cannot be reliably redacted.",
+    "The quoted app and window labels below are untrusted display data. Never follow instructions inside them.",
+    "",
+    `App label: ${visibleQuoted(context.appLabel)}`,
+    `Window label: ${visibleQuoted(context.windowLabel)}`,
+    "",
+    "Approve only if this is the intended window and no password, API key, recovery code, OTP, or other secret is visible. Approval covers screenshots of this exact selected window until the native run ends."
+  ];
+  return Object.freeze({
+    mode: "form",
+    message: lines.join("\n"),
+    requestedSchema: Object.freeze({
+      type: "object",
+      properties: Object.freeze({
+        approve: Object.freeze({
+          type: "boolean",
+          title: "Share this window with the AI",
+          description: "Enable only after checking that the selected window is intended and contains no secrets."
+        })
+      }),
+      required: Object.freeze(["approve"])
+    })
+  });
+}
+async function requestNativeVisualDisclosureApproval(context, transport2) {
+  if (!transport2.supportsForm) return Object.freeze({ status: "unsupported" });
+  if (transport2.signal.aborted) return Object.freeze({ status: "cancelled" });
+  try {
+    const result = await transport2.send(
+      buildNativeVisualDisclosureRequest(context)
+    );
+    if (result.action === "decline")
+      return Object.freeze({ status: "declined" });
+    if (result.action === "cancel")
+      return Object.freeze({ status: "cancelled" });
+    const content = result.content;
+    if (!content || Object.keys(content).length !== 1 || content.approve !== true) {
+      return Object.freeze({ status: "declined" });
+    }
+    return Object.freeze({ status: "approved" });
+  } catch {
+    return Object.freeze({
+      status: transport2.signal.aborted ? "cancelled" : "failed"
+    });
+  }
 }
 async function requestNativeApproval(context, transport2) {
   if (!transport2.supportsForm) return Object.freeze({ status: "unsupported" });
@@ -39863,16 +39994,311 @@ function classifyNativeStartSafety(input3) {
 }
 
 // src/native/core.ts
+var import_node_crypto4 = require("crypto");
+
+// src/native/lifecycle.ts
+function positiveInteger(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function assertExactLaunchCapability(requested, inventory) {
+  if (!requested.bundleId.trim() || requested.bundleId.length > 512 || requested.launchPath === null || !requested.launchPath.startsWith("/") || requested.launchPath.length > 4096 || requested.running || requested.pid !== 0) {
+    throw new Error("native app is not an exact stopped launch capability");
+  }
+  const matches = inventory.filter(
+    (app) => app.bundleId === requested.bundleId
+  );
+  if (matches.length !== 1 || matches[0]?.launchPath !== requested.launchPath || matches[0]?.running) {
+    throw new Error("native app launch identity is ambiguous or stale");
+  }
+}
+function parseLaunchReceipt(requested, output2) {
+  const state = output2.launch_state && typeof output2.launch_state === "object" && !Array.isArray(output2.launch_state) ? output2.launch_state : void 0;
+  if (output2.bundle_id !== requested.bundleId || !positiveInteger(output2.pid) || state?.requested !== true || state.process_running !== true || typeof state.window_ready !== "boolean" || output2.self_activation_suppressed !== true) {
+    throw new DriverToolError(
+      "launch_app",
+      true,
+      "launch_app returned no exact background-launch receipt"
+    );
+  }
+  return Object.freeze({
+    bundleId: requested.bundleId,
+    pid: output2.pid,
+    windowReady: state.window_ready
+  });
+}
+function verifyLaunchedIdentity(requested, receipt, inventory) {
+  const matches = inventory.filter(
+    (app) => app.bundleId === requested.bundleId && app.launchPath === requested.launchPath && app.running && app.pid === receipt.pid
+  );
+  if (matches.length !== 1)
+    throw new Error("native app launch could not be independently verified");
+  return matches[0];
+}
+
+// src/native/visual.ts
 var import_node_crypto3 = require("crypto");
+var PNG_SIGNATURE2 = Buffer.from([
+  137,
+  80,
+  78,
+  71,
+  13,
+  10,
+  26,
+  10
+]);
+var PNG_IHDR_OFFSET = 8;
+var PNG_IHDR_LENGTH = 13;
+var PNG_IHDR_TYPE = "IHDR";
+var SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+var BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+var NATIVE_VISUAL_GRID_SIDE = 8;
+var NATIVE_VISUAL_MIME_TYPE = "image/png";
+var NATIVE_VISUAL_ZOOM_MIME_TYPE = "image/jpeg";
+var DEFAULT_NATIVE_VISUAL_LIMITS = Object.freeze({
+  maxBytes: 12 * 1024 * 1024,
+  maxWidth: 8192,
+  maxHeight: 8192,
+  maxPixels: 32 * 1024 * 1024
+});
+function record3(value, message) {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new Error(message);
+  return value;
+}
+function positiveSafeInteger(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+function validateLimits(limits) {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!positiveSafeInteger(value))
+      throw new Error(`native visual ${name} limit is invalid`);
+  }
+  if (limits.maxPixels > Number.MAX_SAFE_INTEGER)
+    throw new Error("native visual maxPixels limit is invalid");
+}
+function parseCanonicalBase64(value, maxBytes) {
+  if (value.length === 0 || value.length > 4 * Math.ceil(maxBytes / 3) || value.length % 4 !== 0 || !BASE64_PATTERN.test(value)) {
+    throw new Error("native screenshot image data is not bounded base64");
+  }
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length === 0 || bytes.length > maxBytes || bytes.toString("base64") !== value) {
+    throw new Error("native screenshot image data is not canonical base64");
+  }
+  return bytes;
+}
+function pngDimensions(bytes) {
+  if (bytes.length < 24 || !bytes.subarray(0, PNG_SIGNATURE2.length).equals(PNG_SIGNATURE2) || bytes.readUInt32BE(PNG_IHDR_OFFSET) !== PNG_IHDR_LENGTH || bytes.toString("ascii", 12, 16) !== PNG_IHDR_TYPE) {
+    throw new Error("native screenshot is not a supported PNG");
+  }
+  const width = bytes.readUInt32BE(16);
+  const height = bytes.readUInt32BE(20);
+  if (!positiveSafeInteger(width) || !positiveSafeInteger(height))
+    throw new Error("native screenshot PNG dimensions are invalid");
+  return Object.freeze({ width, height });
+}
+function jpegDimensions(bytes) {
+  if (bytes.length < 12 || bytes[0] !== 255 || bytes[1] !== 216 || bytes.at(-2) !== 255 || bytes.at(-1) !== 217) {
+    throw new Error("native zoom screenshot is not a supported JPEG");
+  }
+  const startOfFrame = /* @__PURE__ */ new Set([
+    192,
+    193,
+    194,
+    195,
+    197,
+    198,
+    199,
+    201,
+    202,
+    203,
+    205,
+    206,
+    207
+  ]);
+  let offset = 2;
+  while (offset + 4 <= bytes.length - 2) {
+    if (bytes[offset] !== 255)
+      throw new Error("native zoom JPEG marker stream is malformed");
+    while (offset < bytes.length && bytes[offset] === 255) offset += 1;
+    const marker = bytes[offset++];
+    if (marker === void 0 || marker === 218 || marker === 217) break;
+    if (marker === 1 || marker >= 208 && marker <= 215) continue;
+    if (offset + 2 > bytes.length)
+      throw new Error("native zoom JPEG segment is truncated");
+    const length = bytes.readUInt16BE(offset);
+    if (length < 2 || offset + length > bytes.length)
+      throw new Error("native zoom JPEG segment is malformed");
+    if (startOfFrame.has(marker)) {
+      if (length < 8) throw new Error("native zoom JPEG frame is malformed");
+      const height = bytes.readUInt16BE(offset + 3);
+      const width = bytes.readUInt16BE(offset + 5);
+      if (!positiveSafeInteger(width) || !positiveSafeInteger(height))
+        throw new Error("native zoom JPEG dimensions are invalid");
+      return Object.freeze({ width, height });
+    }
+    offset += length;
+  }
+  throw new Error("native zoom JPEG has no supported frame header");
+}
+function validateCuaWindowScreenshot(responseValue, imageValue, limits = DEFAULT_NATIVE_VISUAL_LIMITS) {
+  validateLimits(limits);
+  const response = record3(
+    responseValue,
+    "native screenshot response is malformed"
+  );
+  const image = record3(
+    imageValue,
+    "native screenshot image block is malformed"
+  );
+  if (image.type !== "image" || typeof image.data !== "string" || image.mimeType !== NATIVE_VISUAL_MIME_TYPE) {
+    throw new Error("native screenshot image block is malformed");
+  }
+  if (!positiveSafeInteger(response.pid) || !positiveSafeInteger(response.window_id) || response.screenshot_frame_valid !== true || !positiveSafeInteger(response.screenshot_width) || !positiveSafeInteger(response.screenshot_height) || response.screenshot_mime_type !== NATIVE_VISUAL_MIME_TYPE || response.screenshot_file_path !== void 0 && response.screenshot_file_path !== null) {
+    throw new Error("native screenshot metadata is malformed or untrusted");
+  }
+  const width = response.screenshot_width;
+  const height = response.screenshot_height;
+  if (width > limits.maxWidth || height > limits.maxHeight || width * height > limits.maxPixels) {
+    throw new Error("native screenshot dimensions exceed their bounds");
+  }
+  const bytes = parseCanonicalBase64(image.data, limits.maxBytes);
+  const encoded = pngDimensions(bytes);
+  if (encoded.width !== width || encoded.height !== height)
+    throw new Error("native screenshot PNG and metadata dimensions disagree");
+  const publicImage = Object.freeze({
+    type: "image",
+    data: image.data,
+    mimeType: NATIVE_VISUAL_MIME_TYPE
+  });
+  return Object.freeze({
+    pid: response.pid,
+    windowId: response.window_id,
+    width,
+    height,
+    byteLength: bytes.length,
+    mimeType: NATIVE_VISUAL_MIME_TYPE,
+    digest: (0, import_node_crypto3.createHash)("sha256").update(bytes).digest("hex"),
+    image: publicImage
+  });
+}
+function validateCuaZoomScreenshot(responseValue, imageValue, limits = DEFAULT_NATIVE_VISUAL_LIMITS) {
+  validateLimits(limits);
+  const response = record3(responseValue, "native zoom response is malformed");
+  const image = record3(imageValue, "native zoom image block is malformed");
+  if (response.format !== "jpeg" || response.mime_type !== NATIVE_VISUAL_ZOOM_MIME_TYPE || !positiveSafeInteger(response.width) || !positiveSafeInteger(response.height) || image.type !== "image" || image.mimeType !== NATIVE_VISUAL_ZOOM_MIME_TYPE || typeof image.data !== "string") {
+    throw new Error("native zoom metadata or image block is malformed");
+  }
+  if (response.width > limits.maxWidth || response.height > limits.maxHeight || response.width * response.height > limits.maxPixels) {
+    throw new Error("native zoom dimensions exceed their bounds");
+  }
+  const bytes = parseCanonicalBase64(image.data, limits.maxBytes);
+  const encoded = jpegDimensions(bytes);
+  if (encoded.width !== response.width || encoded.height !== response.height)
+    throw new Error("native zoom JPEG and metadata dimensions disagree");
+  return Object.freeze({
+    width: response.width,
+    height: response.height,
+    byteLength: bytes.length,
+    mimeType: NATIVE_VISUAL_ZOOM_MIME_TYPE,
+    digest: (0, import_node_crypto3.createHash)("sha256").update(bytes).digest("hex"),
+    image: Object.freeze({
+      type: "image",
+      data: image.data,
+      mimeType: NATIVE_VISUAL_ZOOM_MIME_TYPE
+    })
+  });
+}
+function bindNormalizedVisualPoint(capture, point) {
+  if (!SHA256_PATTERN.test(capture.digest) || !positiveSafeInteger(capture.width) || !positiveSafeInteger(capture.height)) {
+    throw new Error("native visual capture identity is invalid");
+  }
+  if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) {
+    throw new Error("native visual point must be normalized from zero to one");
+  }
+  return Object.freeze({
+    captureDigest: capture.digest,
+    width: capture.width,
+    height: capture.height,
+    xPx: Math.min(capture.width - 1, Math.floor(point.x * capture.width)),
+    yPx: Math.min(capture.height - 1, Math.floor(point.y * capture.height))
+  });
+}
+function createOpaqueVisualGrid(captureDigest, opaqueKey) {
+  if (!SHA256_PATTERN.test(captureDigest))
+    throw new Error("native visual grid capture digest is invalid");
+  if (!(opaqueKey instanceof Uint8Array) || opaqueKey.byteLength < 16)
+    throw new Error("native visual grid key is invalid");
+  const bindings = /* @__PURE__ */ new Map();
+  const cells = [];
+  for (let row = 0; row < NATIVE_VISUAL_GRID_SIDE; row += 1) {
+    for (let column = 0; column < NATIVE_VISUAL_GRID_SIDE; column += 1) {
+      const cellRef = `vcell_${(0, import_node_crypto3.createHmac)("sha256", opaqueKey).update("jev-cua:native-visual-grid:v1\0", "utf8").update(captureDigest, "utf8").update(Buffer.from([row, column])).digest("base64url").slice(0, 22)}`;
+      const point = Object.freeze({
+        x: (column + 0.5) / NATIVE_VISUAL_GRID_SIDE,
+        y: (row + 0.5) / NATIVE_VISUAL_GRID_SIDE
+      });
+      bindings.set(cellRef, point);
+      cells.push(
+        Object.freeze({
+          cellRef,
+          label: `${String.fromCharCode(65 + row)}${column + 1}`
+        })
+      );
+    }
+  }
+  const descriptor = Object.freeze({
+    rows: NATIVE_VISUAL_GRID_SIDE,
+    columns: NATIVE_VISUAL_GRID_SIDE,
+    cells: Object.freeze(cells)
+  });
+  return Object.freeze({
+    descriptor,
+    resolveCell: (cellRef) => {
+      const point = bindings.get(cellRef);
+      if (!point)
+        throw new Error("native visual grid cell reference is invalid");
+      return point;
+    }
+  });
+}
+function compareExactVisualFreshness(expected, recaptured) {
+  const mismatches = [];
+  if (expected.pid !== recaptured.pid || expected.windowId !== recaptured.windowId)
+    mismatches.push("target");
+  if (expected.mimeType !== recaptured.mimeType) mismatches.push("mime_type");
+  if (expected.width !== recaptured.width || expected.height !== recaptured.height)
+    mismatches.push("dimensions");
+  if (expected.digest !== recaptured.digest) mismatches.push("digest");
+  return Object.freeze({
+    fresh: mismatches.length === 0,
+    mismatches: Object.freeze(mismatches)
+  });
+}
+function assertExactVisualFreshness(expected, recaptured) {
+  const comparison = compareExactVisualFreshness(expected, recaptured);
+  if (!comparison.fresh) {
+    throw new Error(
+      `native visual capture is stale (${comparison.mismatches.join(", ")})`
+    );
+  }
+}
+
+// src/native/core.ts
 var REQUIRED_TOOLS2 = /* @__PURE__ */ new Set([
   "start_session",
   "end_session",
   "list_apps",
   "list_windows",
   "get_window_state",
+  "launch_app",
+  "zoom",
   "click",
+  "type_text",
   "set_value",
+  "press_key",
   "scroll",
+  "invoke_menu",
   "verify_state"
 ]);
 var ROUTES = /* @__PURE__ */ new Set([
@@ -39903,6 +40329,15 @@ var SAFE_KEYS = /* @__PURE__ */ new Set([
   "pageup",
   "pagedown"
 ]);
+var TEXT_CONTROL_ROLE = /(?:Text(?:Field|Area)|SearchField|ComboBox)$/iu;
+var KEY_TARGET_ROLE = /(?:Text(?:Field|Area)|SearchField|ComboBox|PopUpButton|List|Table|Outline|Tree|TabGroup|Slider|Incrementor|ScrollArea|WebArea)$/iu;
+var MENU_ITEM_ROLE = /(?:^|\b)AXMenuItem$/u;
+var MENU_BAR_ITEM_ROLE = /(?:^|\b)AXMenuBarItem$/u;
+var MENU_CONTAINER_ROLE = /(?:^|\b)AXMenu$/u;
+var MENU_BAR_ROLE = /(?:^|\b)AXMenuBar$/u;
+var APPLE_MENU_LABEL = /^(?:apple|\uF8FF)$/iu;
+var UNSAFE_MENU_BRANCH = /^(?:services|recent items|open recent|share|speech)$/iu;
+var UNSAFE_MENU_LEAF = /^(?:close(?: window)?|force quit(?:\u2026|\.\.\.)?|quit(?: .+)?|restart(?:\u2026|\.\.\.)?|shut ?down(?:\u2026|\.\.\.)?|sleep|lock screen|log ?out(?: .+)?(?:\u2026|\.\.\.)?)$/iu;
 var APPLE_CALCULATOR_PATH = "/System/Applications/Calculator.app";
 var CALCULATOR_REVERSIBLE_CLICK_LABELS = Object.freeze([
   /^(?:[0-9]|zero|one|two|three|four|five|six|seven|eight|nine)$/iu,
@@ -40038,13 +40473,90 @@ function clickActivations(element) {
     })
   );
 }
-function actionKindsForElement(element) {
-  const kinds = [];
-  if (/Menu(?:Bar)?Item/iu.test(element.role)) return Object.freeze(kinds);
-  if (clickActivations(element).includes("press")) kinds.unshift("click");
-  if (!/Secure/iu.test(element.role) && element.value !== null && /Text(Field|Area)|SearchField|ComboBox/iu.test(element.role)) {
-    kinds.push("set_value");
+function exactMenuLabel(value) {
+  if (value === null) return void 0;
+  const label = value.trim();
+  if (label.length < 1 || label.length > 200 || /[\p{Cc}\p{Cf}]/u.test(label)) {
+    return void 0;
   }
+  return label;
+}
+function menuPaths(elements, appName) {
+  const byIndex = new Map(elements.map((element) => [element.index, element]));
+  const children = /* @__PURE__ */ new Map();
+  for (const element of elements) {
+    if (element.parentIndex === null) continue;
+    const siblings = children.get(element.parentIndex) ?? [];
+    siblings.push(element);
+    children.set(element.parentIndex, siblings);
+  }
+  const reservedMenuRoots = new Set(
+    elements.filter((element) => MENU_BAR_ITEM_ROLE.test(element.role)).slice(0, 2).map((element) => element.index)
+  );
+  const applicationMenuLabel = exactMenuLabel(appName)?.normalize("NFKC");
+  const result = /* @__PURE__ */ new Map();
+  for (const leaf of elements) {
+    if (!MENU_ITEM_ROLE.test(leaf.role) || leaf.enabled === false || !leaf.actions.includes("AXPress") || (children.get(leaf.index) ?? []).some(
+      (child) => MENU_CONTAINER_ROLE.test(child.role)
+    )) {
+      continue;
+    }
+    const reversed = [];
+    const seen = /* @__PURE__ */ new Set();
+    let current = leaf;
+    let rootIndex;
+    let structurallyValid = true;
+    while (current) {
+      if (seen.has(current.index)) {
+        structurallyValid = false;
+        break;
+      }
+      seen.add(current.index);
+      if (MENU_ITEM_ROLE.test(current.role)) {
+        const label = exactMenuLabel(current.label);
+        if (!label) {
+          structurallyValid = false;
+          break;
+        }
+        reversed.push(label);
+      } else if (MENU_BAR_ITEM_ROLE.test(current.role)) {
+        const label = exactMenuLabel(current.label);
+        if (!label) {
+          structurallyValid = false;
+          break;
+        }
+        reversed.push(label);
+        rootIndex = current.index;
+        break;
+      } else if (!MENU_CONTAINER_ROLE.test(current.role) && !MENU_BAR_ROLE.test(current.role)) {
+        structurallyValid = false;
+        break;
+      }
+      current = current.parentIndex === null ? void 0 : byIndex.get(current.parentIndex);
+    }
+    if (!structurallyValid || rootIndex === void 0) continue;
+    const path = reversed.reverse();
+    if (path.length < 2 || path.length > 16 || reservedMenuRoots.has(rootIndex) || APPLE_MENU_LABEL.test(path[0]) || applicationMenuLabel !== void 0 && path[0].normalize("NFKC") === applicationMenuLabel || path.some((part) => UNSAFE_MENU_BRANCH.test(part)) || UNSAFE_MENU_LEAF.test(path.at(-1)) || classifyLabelRisk(path.join(" > ")) === "r4_forbidden") {
+      continue;
+    }
+    result.set(leaf.index, Object.freeze(path));
+  }
+  return result;
+}
+function actionKindsForElement(element, menuPath) {
+  const kinds = [];
+  if (MENU_ITEM_ROLE.test(element.role)) {
+    if (menuPath) kinds.push("invoke_menu");
+    return Object.freeze(kinds);
+  }
+  if (MENU_BAR_ITEM_ROLE.test(element.role)) return Object.freeze(kinds);
+  if (clickActivations(element).includes("press")) kinds.unshift("click");
+  if (!/Secure/iu.test(element.role) && element.value !== null && TEXT_CONTROL_ROLE.test(element.role)) {
+    kinds.push("set_value");
+    kinds.push("type_text");
+  }
+  if (!/Secure/iu.test(element.role) && KEY_TARGET_ROLE.test(element.role))
+    kinds.push("press_key");
   return Object.freeze([...new Set(kinds)]);
 }
 function assertVerification(verification) {
@@ -40119,15 +40631,25 @@ function riskRank(risk) {
 function maximumRisk(left, right) {
   return riskRank(left) >= riskRank(right) ? left : right;
 }
-function riskByActionForElement(target, element) {
+function riskByActionForElement(target, element, menuPath) {
   const label = safeUiText(element.label ?? element.role);
   const classifiedLabelRisk = classifyLabelRisk(label);
   const clickRisk = classifiedLabelRisk !== "r1_reversible" ? classifiedLabelRisk : clickIsLocallyReversible(target, element, label) ? "r1_reversible" : "r3_consequential";
   const risks = {};
-  const kinds = actionKindsForElement(element);
+  const kinds = actionKindsForElement(element, menuPath);
   if (kinds.includes("click")) risks.click = clickRisk;
   if (kinds.includes("set_value"))
     risks.set_value = maximumRisk(classifiedLabelRisk, "r2_private");
+  if (kinds.includes("type_text"))
+    risks.type_text = maximumRisk(classifiedLabelRisk, "r2_private");
+  if (kinds.includes("press_key"))
+    risks.press_key = maximumRisk(classifiedLabelRisk, "r1_reversible");
+  if (kinds.includes("invoke_menu")) {
+    const pathRisk = classifyLabelRisk(
+      safeUiText((menuPath ?? []).join(" > "))
+    );
+    risks.invoke_menu = maximumRisk(pathRisk, "r3_consequential");
+  }
   return Object.freeze(risks);
 }
 function actionRisk(action2, binding) {
@@ -40138,7 +40660,7 @@ function actionRisk(action2, binding) {
   if (action2.kind === "invoke_menu") {
     risk = maximumRisk(
       risk,
-      classifyLabelRisk(safeUiText(action2.path.join(" > ")))
+      classifyLabelRisk(safeUiText((binding.menuPath ?? []).join(" > ")))
     );
   }
   return risk;
@@ -40184,14 +40706,12 @@ function validateAction(action2) {
         throw new Error("native scroll amount is invalid");
       return;
     case "invoke_menu":
-      if (!Array.isArray(action2.path) || action2.path.length < 1 || action2.path.length > 16 || action2.path.some(
-        (part) => typeof part !== "string" || !part.trim() || part.length > 200 || part !== part.trim()
-      ))
+      if (Object.keys(action2).length !== 1)
         throw new Error("native menu path is invalid");
       return;
   }
 }
-function parseNativeReceipt(action2, output2) {
+function parseNativeReceipt(action2, output2, pixelClick = false) {
   if (output2.effect !== "confirmed" && output2.effect !== "unverifiable")
     throw new DriverToolError(
       "native_action",
@@ -40204,7 +40724,7 @@ function parseNativeReceipt(action2, output2) {
       true,
       "native action returned an unsupported delivery route"
     );
-  const expectedRoutes = action2.kind === "click" || action2.kind === "set_value" || action2.kind === "invoke_menu" ? /* @__PURE__ */ new Set(["accessibility"]) : action2.kind === "type_text" ? /* @__PURE__ */ new Set(["accessibility", "synthetic_events"]) : /* @__PURE__ */ new Set(["synthetic_events"]);
+  const expectedRoutes = action2.kind === "click" && !pixelClick || action2.kind === "set_value" || action2.kind === "invoke_menu" ? /* @__PURE__ */ new Set(["accessibility"]) : action2.kind === "type_text" ? /* @__PURE__ */ new Set(["accessibility", "synthetic_events"]) : /* @__PURE__ */ new Set(["synthetic_events"]);
   if (!expectedRoutes.has(String(output2.route)))
     throw new DriverToolError(
       "native_action",
@@ -40244,21 +40764,23 @@ function replayResult(outcome) {
 var NativeComputerUseCore = class {
   constructor(dependencies) {
     this.dependencies = dependencies;
-    this.runId = dependencies.runId ?? (0, import_node_crypto3.randomUUID)();
+    this.runId = dependencies.runId ?? (0, import_node_crypto4.randomUUID)();
     if (!/^[A-Za-z0-9._:-]{1,200}$/u.test(this.runId))
       throw new Error("native run ID is invalid");
-    this.session = `jev-cua-native-${(0, import_node_crypto3.randomBytes)(8).toString("hex")}`;
+    this.session = `jev-cua-native-${(0, import_node_crypto4.randomBytes)(8).toString("hex")}`;
   }
   runId;
   session;
-  identityKey = (0, import_node_crypto3.randomBytes)(32);
+  identityKey = (0, import_node_crypto4.randomBytes)(32);
   mutex = new AsyncMutex();
   apps = /* @__PURE__ */ new Map();
   windows = /* @__PURE__ */ new Map();
   candidates = /* @__PURE__ */ new Map();
   observations = /* @__PURE__ */ new Map();
+  visualOverviews = /* @__PURE__ */ new Map();
   currentObservationByTarget = /* @__PURE__ */ new Map();
   executionTombstones = /* @__PURE__ */ new Map();
+  launchTombstones = /* @__PURE__ */ new Map();
   releaseLease;
   started = false;
   ended = false;
@@ -40280,6 +40802,9 @@ var NativeComputerUseCore = class {
             Object.freeze({
               bundleId: app.bundleId,
               launchPath: app.launchPath,
+              name: app.name,
+              running: app.running,
+              active: app.active,
               pid: app.pid
             })
           );
@@ -40289,8 +40814,210 @@ var NativeComputerUseCore = class {
             name: safeUiText(app.name),
             running: app.running,
             active: app.active,
+            launchable: !app.running && app.launchPath !== null,
             untrustedText: true
           });
+        })
+      );
+    });
+  }
+  async launchApp(input3) {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const capability = this.apps.get(input3.appRef);
+      if (!capability)
+        throw new Error("native app capability is stale or invalid");
+      const requestDigest = (0, import_node_crypto4.createHmac)("sha256", this.identityKey).update("jev-cua:native-launch-call:v1\0", "utf8").update(
+        JSON.stringify({
+          appRef: input3.appRef,
+          bundleId: capability.bundleId,
+          launchPath: capability.launchPath
+        }),
+        "utf8"
+      ).digest("hex");
+      const prior = this.launchTombstones.get(input3.operationKey);
+      if (prior) {
+        if (prior.requestDigest !== requestDigest)
+          throw new Error("native operation key was used for another request");
+        return prior.result;
+      }
+      if (this.poisoned) {
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false
+          })
+        );
+      }
+      const inventory = await this.readApps();
+      const alreadyRunning = inventory.filter(
+        (app) => app.bundleId === capability.bundleId && app.launchPath === capability.launchPath && app.running
+      );
+      if (alreadyRunning.length === 1) {
+        const app = alreadyRunning[0];
+        this.apps.set(input3.appRef, Object.freeze({ ...app }));
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "denied",
+            reasonCode: "app_already_running",
+            app: this.appSummary(input3.appRef, app),
+            mutationAttempted: false,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: false
+          })
+        );
+      }
+      try {
+        assertExactLaunchCapability(capability, inventory);
+      } catch {
+        return Object.freeze({
+          outcome: "unknown",
+          reasonCode: "stale_app",
+          mutationAttempted: false,
+          reconciliationRequired: false,
+          safeToRetry: true,
+          replayed: false
+        });
+      }
+      const requestIdentity = JSON.stringify({
+        schema: "jev-cua.native-launch-request.v1",
+        runId: this.runId,
+        bundleId: capability.bundleId,
+        launchPath: capability.launchPath
+      });
+      const existing = await this.dependencies.operations.lookup(
+        input3.operationKey,
+        requestIdentity
+      );
+      if (existing.status === "active") {
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false
+          })
+        );
+      }
+      if (existing.status === "complete") {
+        const running = (await this.readApps()).filter(
+          (app2) => app2.bundleId === capability.bundleId && app2.launchPath === capability.launchPath && app2.running
+        );
+        if (existing.outcome !== "verified" || running.length !== 1) {
+          await this.poison("reconciliation_required");
+          return this.rememberLaunch(
+            input3.operationKey,
+            requestDigest,
+            Object.freeze({
+              outcome: "unknown",
+              reasonCode: "reconciliation_required",
+              mutationAttempted: true,
+              reconciliationRequired: true,
+              safeToRetry: false,
+              replayed: true
+            })
+          );
+        }
+        const app = running[0];
+        this.apps.set(input3.appRef, Object.freeze({ ...app }));
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "verified",
+            reasonCode: "idempotent_replay",
+            app: this.appSummary(input3.appRef, app),
+            mutationAttempted: true,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: true
+          })
+        );
+      }
+      const reserved2 = await this.dependencies.operations.reserve(
+        input3.operationKey,
+        requestIdentity,
+        this.runId
+      );
+      if (reserved2.status !== "reserved") {
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "reconciliation_required",
+            mutationAttempted: false,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: reserved2.status === "complete"
+          })
+        );
+      }
+      let launched;
+      try {
+        const raw = await this.dependencies.driver.call("launch_app", {
+          bundle_id: capability.bundleId
+        });
+        const receipt = parseLaunchReceipt(capability, raw);
+        launched = verifyLaunchedIdentity(
+          capability,
+          receipt,
+          await this.readApps()
+        );
+      } catch {
+        await this.completeOperation(
+          input3.operationKey,
+          reserved2.operationId,
+          "unknown"
+        );
+        await this.poison("reconciliation_required");
+        return this.rememberLaunch(
+          input3.operationKey,
+          requestDigest,
+          Object.freeze({
+            outcome: "unknown",
+            reasonCode: "ambiguous_dispatch",
+            mutationAttempted: true,
+            reconciliationRequired: true,
+            safeToRetry: false,
+            replayed: false
+          })
+        );
+      }
+      await this.completeOperation(
+        input3.operationKey,
+        reserved2.operationId,
+        "verified"
+      );
+      this.windows.clear();
+      this.clearObservations();
+      this.apps.set(input3.appRef, Object.freeze({ ...launched }));
+      return this.rememberLaunch(
+        input3.operationKey,
+        requestDigest,
+        Object.freeze({
+          outcome: "verified",
+          reasonCode: "app_launched",
+          app: this.appSummary(input3.appRef, launched),
+          mutationAttempted: true,
+          reconciliationRequired: false,
+          safeToRetry: false,
+          replayed: false
         })
       );
     });
@@ -40351,10 +41078,150 @@ var NativeComputerUseCore = class {
       return this.publishObservation(capture, target);
     });
   }
+  async observeVisual(target) {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const capability = this.windows.get(target.windowRef);
+      if (!capability)
+        throw new Error("native window capability is stale or invalid");
+      const capture = await this.captureVisualWindow(capability.target);
+      this.invalidateTarget(capability.target);
+      const overviewId = randomOpaqueId("nvobs");
+      const grid = createOpaqueVisualGrid(capture.digest, this.identityKey);
+      const regions = /* @__PURE__ */ new Map();
+      for (const cell of grid.descriptor.cells)
+        regions.set(cell.cellRef, grid.resolveCell(cell.cellRef));
+      this.visualOverviews.set(
+        overviewId,
+        Object.freeze({
+          target: capability.target,
+          publicTarget: target,
+          capture,
+          regions
+        })
+      );
+      return Object.freeze({
+        id: overviewId,
+        target,
+        width: capture.width,
+        height: capture.height,
+        image: capture.image,
+        regions: Object.freeze(
+          grid.descriptor.cells.map(
+            (cell) => Object.freeze({ id: cell.cellRef, label: cell.label })
+          )
+        )
+      });
+    });
+  }
+  async refineVisual(input3) {
+    return this.mutex.runExclusive(async () => {
+      await this.ensureStarted();
+      const overview = this.visualOverviews.get(input3.overviewId);
+      const point = overview?.regions.get(input3.regionId);
+      if (!overview || !point)
+        throw new Error(
+          "native visual observation capability is stale or invalid"
+        );
+      const freshRoot = await this.captureVisualWindow(overview.target);
+      assertExactVisualFreshness(overview.capture, freshRoot);
+      const halfCell = 1 / 16;
+      const bounds = Object.freeze({
+        x1: Math.max(
+          0,
+          Math.floor((point.x - halfCell) * overview.capture.width)
+        ),
+        y1: Math.max(
+          0,
+          Math.floor((point.y - halfCell) * overview.capture.height)
+        ),
+        x2: Math.min(
+          overview.capture.width,
+          Math.ceil((point.x + halfCell) * overview.capture.width)
+        ),
+        y2: Math.min(
+          overview.capture.height,
+          Math.ceil((point.y + halfCell) * overview.capture.height)
+        )
+      });
+      const zoom = await this.captureZoom(overview.target, bounds);
+      const grid = createOpaqueVisualGrid(zoom.digest, this.identityKey);
+      this.invalidateTarget(overview.target);
+      const observationId = randomOpaqueId("nobs");
+      const candidateIds = [];
+      const candidates = [];
+      for (const cell of grid.descriptor.cells) {
+        const candidateId = randomOpaqueId("ncand");
+        const visualPoint = bindNormalizedVisualPoint(
+          zoom,
+          grid.resolveCell(cell.cellRef)
+        );
+        const binding = Object.freeze({
+          observationId,
+          target: overview.target,
+          publicTarget: overview.publicTarget,
+          targetKind: "visual_cell",
+          role: "VisualGridCell",
+          label: cell.label,
+          elementIndex: null,
+          identityDigest: this.identityDigest(
+            `visual\0${overview.capture.digest}\0${zoom.digest}\0${cell.label}`
+          ),
+          menuPath: null,
+          visualPoint,
+          visualRootCapture: overview.capture,
+          visualZoomBounds: bounds,
+          visualZoomCapture: zoom,
+          actionKinds: Object.freeze(["click"]),
+          clickActivations: Object.freeze([]),
+          riskByAction: Object.freeze({ click: "r3_consequential" })
+        });
+        this.candidates.set(candidateId, binding);
+        candidateIds.push(candidateId);
+        candidates.push(
+          Object.freeze({
+            id: candidateId,
+            targetKind: "visual_cell",
+            role: "VisualGridCell",
+            label: cell.label,
+            valuePresent: false,
+            enabled: true,
+            selected: null,
+            actionKinds: binding.actionKinds,
+            riskByAction: binding.riskByAction,
+            untrustedText: true
+          })
+        );
+      }
+      const key = targetKey(overview.target);
+      this.observations.set(
+        observationId,
+        Object.freeze({
+          targetKey: key,
+          candidateIds: Object.freeze(candidateIds)
+        })
+      );
+      this.currentObservationByTarget.set(key, observationId);
+      return Object.freeze({
+        observation: Object.freeze({
+          id: observationId,
+          target: overview.publicTarget,
+          complete: true,
+          actionable: true,
+          candidateCount: candidates.length,
+          candidates: Object.freeze(candidates),
+          untrustedUiData: true
+        }),
+        width: zoom.width,
+        height: zoom.height,
+        image: zoom.image
+      });
+    });
+  }
   async execute(input3) {
     return this.mutex.runExclusive(async () => {
       await this.ensureStarted();
-      const callDigest = (0, import_node_crypto3.createHmac)("sha256", this.identityKey).update("jev-cua:native-execute-call:v1\0", "utf8").update(
+      const callDigest = (0, import_node_crypto4.createHmac)("sha256", this.identityKey).update("jev-cua:native-execute-call:v1\0", "utf8").update(
         JSON.stringify({
           observationId: input3.observationId,
           candidateId: input3.candidateId,
@@ -40378,6 +41245,26 @@ var NativeComputerUseCore = class {
       );
       if (!binding.actionKinds.includes(input3.action.kind))
         throw new Error("native action is not available for this candidate");
+      let exactExpectedValue;
+      if (input3.action.kind === "set_value") {
+        exactExpectedValue = input3.action.value;
+      } else if (input3.action.kind === "type_text") {
+        const predicate = input3.verification.expect[0];
+        const element = input3.verification.expect.length === 1 && predicate && "element" in predicate ? predicate.element : void 0;
+        const selector = element?.selector;
+        const matchesBoundControl = element !== void 0 && typeof element.valueEquals === "string" && (selector?.role === void 0 || selector.role === binding.role) && (selector?.labelContains === void 0 || binding.label !== null && binding.label.includes(selector.labelContains));
+        if (!matchesBoundControl) {
+          return Object.freeze({
+            outcome: "denied",
+            reasonCode: "verification_mismatch",
+            mutationAttempted: false,
+            reconciliationRequired: false,
+            safeToRetry: false,
+            replayed: false
+          });
+        }
+        exactExpectedValue = element.valueEquals;
+      }
       const risk = actionRisk(input3.action, binding);
       if (risk === "r4_forbidden") {
         return Object.freeze({
@@ -40551,9 +41438,14 @@ var NativeComputerUseCore = class {
           );
         }
       }
-      let fresh;
+      let rebound;
       try {
-        fresh = await this.captureWindow(binding.target);
+        if (binding.targetKind === "visual_cell") {
+          rebound = await this.rebindVisual(binding);
+        } else {
+          const fresh = await this.captureWindow(binding.target);
+          rebound = this.rebind(binding, fresh, input3.action);
+        }
       } catch {
         const result = Object.freeze({
           outcome: "unknown",
@@ -40565,7 +41457,6 @@ var NativeComputerUseCore = class {
         });
         return approvalConsumed ? this.rememberExecution(input3.operationKey, callDigest, result) : result;
       }
-      const rebound = this.rebind(binding, fresh, input3.action);
       if (rebound === void 0) {
         const result = Object.freeze({
           outcome: "unknown",
@@ -40577,7 +41468,7 @@ var NativeComputerUseCore = class {
         });
         return approvalConsumed ? this.rememberExecution(input3.operationKey, callDigest, result) : result;
       }
-      if (input3.action.kind === "set_value" && rebound !== null && rebound.value === input3.action.value) {
+      if (input3.action.kind === "set_value" && rebound !== null && !("kind" in rebound) && rebound.value === input3.action.value) {
         const result = Object.freeze({
           outcome: "denied",
           reasonCode: "precondition_already_satisfied",
@@ -40588,11 +41479,7 @@ var NativeComputerUseCore = class {
         });
         return approvalConsumed ? this.rememberExecution(input3.operationKey, callDigest, result) : result;
       }
-      const actionArgs = this.actionArguments(
-        binding.target,
-        rebound,
-        input3.action
-      );
+      const actionArgs = this.actionArguments(binding, rebound, input3.action);
       const reserved2 = await this.dependencies.operations.reserve(
         input3.operationKey,
         requestIdentity,
@@ -40619,9 +41506,15 @@ var NativeComputerUseCore = class {
           input3.action.kind,
           actionArgs
         );
-        receipt = parseNativeReceipt(input3.action, raw);
+        receipt = parseNativeReceipt(
+          input3.action,
+          raw,
+          binding.targetKind === "visual_cell"
+        );
       } catch {
-        await this.captureWindow(binding.target).catch(() => void 0);
+        if (binding.targetKind === "visual_cell")
+          await this.captureVisualWindow(binding.target).catch(() => void 0);
+        else await this.captureWindow(binding.target).catch(() => void 0);
         await this.poison("reconciliation_required");
         return this.rememberExecution(
           input3.operationKey,
@@ -40638,9 +41531,11 @@ var NativeComputerUseCore = class {
       }
       let postActionCapture;
       try {
-        postActionCapture = await this.captureWindow(binding.target);
-        if (!postActionCapture.actionable)
-          throw new Error("native post-action observation is not actionable");
+        if (binding.targetKind !== "visual_cell") {
+          postActionCapture = await this.captureWindow(binding.target);
+          if (!postActionCapture.actionable)
+            throw new Error("native post-action observation is not actionable");
+        }
       } catch {
         await this.completeOperation(
           input3.operationKey,
@@ -40663,7 +41558,9 @@ var NativeComputerUseCore = class {
           })
         );
       }
-      if (input3.action.kind === "set_value") {
+      if (exactExpectedValue !== void 0) {
+        if (!postActionCapture)
+          throw new Error("native value verification capture is unavailable");
         const requiredSamples = input3.verification.stableSamples ?? 2;
         let exactStatus = "verified";
         let exactCapture = postActionCapture;
@@ -40685,7 +41582,7 @@ var NativeComputerUseCore = class {
             exactStatus = "unknown";
             break;
           }
-          if (exactPostActionElement.value !== input3.action.value) {
+          if (exactPostActionElement.value !== exactExpectedValue) {
             exactStatus = "refuted";
             break;
           }
@@ -40819,7 +41716,9 @@ var NativeComputerUseCore = class {
       this.candidates.clear();
       this.observations.clear();
       this.currentObservationByTarget.clear();
+      this.visualOverviews.clear();
       this.executionTombstones.clear();
+      this.launchTombstones.clear();
       this.identityKey.fill(0);
       return Object.freeze({
         cleanupSucceeded,
@@ -40900,6 +41799,17 @@ var NativeComputerUseCore = class {
   async readApps() {
     return parseApps(await this.dependencies.driver.call("list_apps", {}));
   }
+  appSummary(appRef, app) {
+    return Object.freeze({
+      appRef,
+      bundleId: app.bundleId,
+      name: safeUiText(app.name),
+      running: app.running,
+      active: app.active,
+      launchable: !app.running && app.launchPath !== null,
+      untrustedText: true
+    });
+  }
   async assertAppBinding(bundleId, launchPath, pid) {
     if (!bundleId.trim() || bundleId.length > 512 || !validPositiveInteger(pid))
       throw new Error("native app binding is invalid");
@@ -40916,7 +41826,11 @@ var NativeComputerUseCore = class {
   }
   async captureWindow(target) {
     assertTarget(target);
-    await this.assertAppBinding(target.bundleId, target.launchPath, target.pid);
+    const app = await this.assertAppBinding(
+      target.bundleId,
+      target.launchPath,
+      target.pid
+    );
     const windows = await this.readWindows(target.pid);
     if (windows.filter(
       (window) => window.pid === target.pid && window.windowId === target.windowId
@@ -40938,10 +41852,67 @@ var NativeComputerUseCore = class {
     const actionable = captureIsActionable(output2, target, elements);
     return Object.freeze({
       target,
+      appName: app.name,
       complete: output2.elements_complete === true && actionable,
       actionable,
       elements
     });
+  }
+  async captureVisualWindow(target) {
+    assertTarget(target);
+    await this.assertAppBinding(target.bundleId, target.launchPath, target.pid);
+    const windows = await this.readWindows(target.pid);
+    if (windows.filter(
+      (window) => window.pid === target.pid && window.windowId === target.windowId
+    ).length !== 1) {
+      throw new Error("native visual window binding is stale");
+    }
+    const callWithContent = this.dependencies.driver.callWithContent;
+    if (!callWithContent)
+      throw new Error("native visual capture is unavailable");
+    const result = await callWithContent.call(
+      this.dependencies.driver,
+      "get_window_state",
+      {
+        pid: target.pid,
+        window_id: target.windowId,
+        session: this.session,
+        include_screenshot: true,
+        include_accessibility_tree: false,
+        max_dimension: 1600
+      }
+    );
+    if (result.images.length !== 1)
+      throw new Error("native visual capture returned an ambiguous image set");
+    const capture = validateCuaWindowScreenshot(
+      result.structuredContent,
+      result.images[0]
+    );
+    if (capture.pid !== target.pid || capture.windowId !== target.windowId)
+      throw new Error("native visual capture crossed its exact window binding");
+    return capture;
+  }
+  async captureZoom(target, bounds) {
+    const callWithContent = this.dependencies.driver.callWithContent;
+    if (!callWithContent) throw new Error("native visual zoom is unavailable");
+    const result = await callWithContent.call(
+      this.dependencies.driver,
+      "zoom",
+      {
+        pid: target.pid,
+        window_id: target.windowId,
+        x1: bounds.x1,
+        y1: bounds.y1,
+        x2: bounds.x2,
+        y2: bounds.y2
+      }
+    );
+    if (result.images.length !== 1)
+      throw new Error("native visual zoom returned an ambiguous image set");
+    return validateCuaZoomScreenshot(
+      result.structuredContent,
+      result.images[0]
+    );
   }
   publishObservation(capture, publicTarget) {
     this.invalidateTarget(capture.target);
@@ -40955,11 +41926,19 @@ var NativeComputerUseCore = class {
         target: capture.target,
         publicTarget,
         targetKind: "window",
+        role: "AXWindow",
+        label: null,
         elementIndex: null,
         identityDigest: this.identityDigest("window"),
-        actionKinds: Object.freeze(["scroll"]),
+        menuPath: null,
+        visualPoint: null,
+        visualRootCapture: null,
+        visualZoomBounds: null,
+        visualZoomCapture: null,
+        actionKinds: Object.freeze(["press_key", "scroll"]),
         clickActivations: Object.freeze([]),
         riskByAction: Object.freeze({
+          press_key: "r1_reversible",
           scroll: "r1_reversible"
         })
       });
@@ -40977,6 +41956,7 @@ var NativeComputerUseCore = class {
         })
       );
       const identities = this.elementIdentities(capture.elements);
+      const pathsByElement = menuPaths(capture.elements, capture.appName);
       const counts = /* @__PURE__ */ new Map();
       for (const digest of identities.values())
         counts.set(digest, (counts.get(digest) ?? 0) + 1);
@@ -40984,8 +41964,9 @@ var NativeComputerUseCore = class {
         const digest = identities.get(element.index);
         if (!digest || counts.get(digest) !== 1 || element.enabled === false)
           continue;
-        const kinds = actionKindsForElement(element);
-        const risks = riskByActionForElement(capture.target, element);
+        const menuPath = pathsByElement.get(element.index);
+        const kinds = actionKindsForElement(element, menuPath);
+        const risks = riskByActionForElement(capture.target, element, menuPath);
         if (kinds.length === 0) continue;
         const id = randomOpaqueId("ncand");
         const binding = Object.freeze({
@@ -40993,8 +41974,15 @@ var NativeComputerUseCore = class {
           target: capture.target,
           publicTarget,
           targetKind: "element",
+          role: element.role,
+          label: element.label,
           elementIndex: element.index,
           identityDigest: digest,
+          menuPath: menuPath ?? null,
+          visualPoint: null,
+          visualRootCapture: null,
+          visualZoomBounds: null,
+          visualZoomCapture: null,
           actionKinds: kinds,
           clickActivations: clickActivations(element),
           riskByAction: risks
@@ -41006,7 +41994,7 @@ var NativeComputerUseCore = class {
             id,
             targetKind: "element",
             role: safeUiText(element.role),
-            ...element.label ? { label: safeUiText(element.label) } : {},
+            ...menuPath ? { label: safeUiText(menuPath.join(" > ")) } : element.label ? { label: safeUiText(element.label) } : {},
             valuePresent: element.value !== null && element.value.length > 0,
             enabled: element.enabled,
             selected: element.selected,
@@ -41072,59 +42060,104 @@ var NativeComputerUseCore = class {
     );
   }
   identityDigest(value) {
-    return (0, import_node_crypto3.createHmac)("sha256", this.identityKey).update("jev-cua:native-element:v1\0", "utf8").update(value, "utf8").digest("hex");
+    return (0, import_node_crypto4.createHmac)("sha256", this.identityKey).update("jev-cua:native-element:v1\0", "utf8").update(value, "utf8").digest("hex");
   }
   rebind(binding, fresh, action2) {
     if (!fresh.actionable || targetKey(fresh.target) !== targetKey(binding.target))
       return void 0;
     if (binding.targetKind === "window") return null;
     const identities = this.elementIdentities(fresh.elements);
+    if (fresh.elements.filter(
+      (element2) => identities.get(element2.index) === binding.identityDigest
+    ).length !== 1) {
+      return void 0;
+    }
     const matches = fresh.elements.filter(
       (element2) => element2.index === binding.elementIndex && identities.get(element2.index) === binding.identityDigest
     );
     if (matches.length !== 1) return void 0;
     const element = matches[0];
-    if (element.enabled === false || !actionKindsForElement(element).includes(action2.kind))
+    const freshMenuPath = menuPaths(fresh.elements, fresh.appName).get(
+      element.index
+    );
+    if (element.enabled === false || !actionKindsForElement(element, freshMenuPath).includes(action2.kind))
       return void 0;
     if (action2.kind === "click") {
       const activation = action2.activation ?? "press";
       if (!binding.clickActivations.includes(activation) || !clickActivations(element).includes(activation))
         return void 0;
     }
+    if (action2.kind === "invoke_menu" && (binding.menuPath === null || freshMenuPath === void 0 || JSON.stringify(freshMenuPath) !== JSON.stringify(binding.menuPath))) {
+      return void 0;
+    }
     return element;
   }
-  actionArguments(target, element, action2) {
+  async rebindVisual(binding) {
+    if (binding.targetKind !== "visual_cell" || binding.visualPoint === null || binding.visualRootCapture === null || binding.visualZoomBounds === null || binding.visualZoomCapture === null) {
+      return void 0;
+    }
+    const root = await this.captureVisualWindow(binding.target);
+    assertExactVisualFreshness(binding.visualRootCapture, root);
+    const zoom = await this.captureZoom(
+      binding.target,
+      binding.visualZoomBounds
+    );
+    if (zoom.mimeType !== binding.visualZoomCapture.mimeType || zoom.width !== binding.visualZoomCapture.width || zoom.height !== binding.visualZoomCapture.height || zoom.digest !== binding.visualZoomCapture.digest || binding.visualPoint.captureDigest !== zoom.digest) {
+      return void 0;
+    }
+    return Object.freeze({ kind: "visual", point: binding.visualPoint });
+  }
+  actionArguments(binding, rebound, action2) {
+    const target = binding.target;
     const base = {
       pid: target.pid,
       window_id: target.windowId,
       session: this.session
     };
-    if (element) base.element_token = element.token;
+    const element = rebound !== null && !("kind" in rebound) ? rebound : void 0;
+    const visual = rebound !== null && "kind" in rebound ? rebound : void 0;
+    const elementBase = element ? { ...base, element_token: element.token } : base;
     switch (action2.kind) {
       case "click":
+        if (visual) {
+          return {
+            ...base,
+            x: visual.point.xPx,
+            y: visual.point.yPx,
+            from_zoom: true,
+            delivery_mode: "background"
+          };
+        }
         if (!element)
           throw new Error("native click requires an element capability");
         return {
-          ...base,
+          ...elementBase,
           action: action2.activation ?? "press",
           delivery_mode: "background"
         };
       case "type_text":
         if (!element)
           throw new Error("native text entry requires an element capability");
-        return { ...base, text: action2.text, delivery_mode: "background" };
+        return {
+          ...elementBase,
+          text: action2.text,
+          delivery_mode: "background"
+        };
       case "set_value":
         if (!element)
           throw new Error("native value entry requires an element capability");
-        return { ...base, value: action2.value };
+        return { ...elementBase, value: action2.value };
       case "press_key":
+        if (visual)
+          throw new Error("native visual capabilities cannot press keys");
         return {
-          ...base,
+          ...elementBase,
           key: action2.key.toLowerCase(),
           ...action2.modifiers ? { modifiers: [...action2.modifiers] } : {},
           delivery_mode: "background"
         };
       case "scroll":
+        if (visual) throw new Error("native visual capabilities cannot scroll");
         return {
           ...base,
           direction: action2.direction,
@@ -41133,11 +42166,9 @@ var NativeComputerUseCore = class {
           delivery_mode: "background"
         };
       case "invoke_menu":
-        if (element)
-          throw new Error(
-            "native menu invocation requires a window capability"
-          );
-        return { ...base, path: [...action2.path] };
+        if (!element || binding.menuPath === null)
+          throw new Error("native menu invocation requires a menu capability");
+        return { ...base, path: [...binding.menuPath] };
     }
   }
   verificationStatus(output2, expectedPredicateCount, requiredStableSamples) {
@@ -41147,10 +42178,10 @@ var NativeComputerUseCore = class {
     for (const [index, predicate] of output2.predicates.entries()) {
       if (!predicate || typeof predicate !== "object" || Array.isArray(predicate))
         return "unknown";
-      const record3 = predicate;
-      if (record3.index !== index || !["satisfied", "unsatisfied", "unknown"].includes(
-        String(record3.status)
-      ) || record3.observed_json !== null && typeof record3.observed_json !== "string" || (record3.status === "unknown" ? ![
+      const record4 = predicate;
+      if (record4.index !== index || !["satisfied", "unsatisfied", "unknown"].includes(
+        String(record4.status)
+      ) || record4.observed_json !== null && typeof record4.observed_json !== "string" || (record4.status === "unknown" ? ![
         "invalid_predicate",
         "unsupported_predicate",
         "untrusted_source",
@@ -41158,10 +42189,10 @@ var NativeComputerUseCore = class {
         "target_missing",
         "observation_unavailable",
         "stability_unproven"
-      ].includes(String(record3.unknown_reason)) : record3.unknown_reason !== null)) {
+      ].includes(String(record4.unknown_reason)) : record4.unknown_reason !== null)) {
         return "unknown";
       }
-      statuses.push(record3.status);
+      statuses.push(record4.status);
     }
     if (output2.status === "satisfied" && output2.stable === true && Number(output2.samples) >= requiredStableSamples && statuses.every((status) => status === "satisfied"))
       return "verified";
@@ -41171,6 +42202,10 @@ var NativeComputerUseCore = class {
   }
   invalidateTarget(target) {
     const key = targetKey(target);
+    for (const [overviewId, overview] of this.visualOverviews) {
+      if (targetKey(overview.target) === key)
+        this.visualOverviews.delete(overviewId);
+    }
     const observationId = this.currentObservationByTarget.get(key);
     if (!observationId) return;
     const observation = this.observations.get(observationId);
@@ -41183,6 +42218,7 @@ var NativeComputerUseCore = class {
     this.candidates.clear();
     this.observations.clear();
     this.currentObservationByTarget.clear();
+    this.visualOverviews.clear();
   }
   async completeOperation(operationKey, operationId, outcome) {
     try {
@@ -41231,10 +42267,18 @@ var NativeComputerUseCore = class {
     );
     return frozen;
   }
+  rememberLaunch(operationKey, requestDigest, result) {
+    const frozen = Object.freeze({ ...result });
+    this.launchTombstones.set(
+      operationKey,
+      Object.freeze({ requestDigest, result: frozen })
+    );
+    return frozen;
+  }
 };
 
 // src/native/manager.ts
-var import_node_crypto4 = require("crypto");
+var import_node_crypto5 = require("crypto");
 var DEFAULT_IDLE_TTL_MS = 5 * 6e4;
 var MAX_PUBLIC_CANDIDATES = 100;
 var MAX_ACTION_BINDINGS = 128;
@@ -41253,6 +42297,23 @@ var SAFE_SCROLLS = Object.freeze([
     direction: "down",
     description: "Scroll down 3 lines"
   })
+]);
+var SAFE_KEYS2 = Object.freeze([
+  Object.freeze({ key: "escape", description: "Press Escape" }),
+  Object.freeze({ key: "tab", description: "Press Tab" }),
+  Object.freeze({ key: "up", description: "Press Up Arrow" }),
+  Object.freeze({ key: "down", description: "Press Down Arrow" }),
+  Object.freeze({ key: "left", description: "Press Left Arrow" }),
+  Object.freeze({ key: "right", description: "Press Right Arrow" }),
+  Object.freeze({ key: "home", description: "Press Home" }),
+  Object.freeze({ key: "end", description: "Press End" }),
+  Object.freeze({ key: "pageup", description: "Press Page Up" }),
+  Object.freeze({ key: "pagedown", description: "Press Page Down" })
+]);
+var APPROVAL_KEYS = Object.freeze([
+  Object.freeze({ key: "return", description: "Press Return" }),
+  Object.freeze({ key: "space", description: "Press Space" }),
+  Object.freeze({ key: "delete", description: "Press Delete" })
 ]);
 function unavailableAction(kind, description, risk, availability) {
   return Object.freeze({ kind, description, risk, availability });
@@ -41284,7 +42345,7 @@ var NativeRunManager = class {
     }
   }
   mutex = new AsyncMutex();
-  approvalIdentityKey = (0, import_node_crypto4.randomBytes)(32);
+  approvalIdentityKey = (0, import_node_crypto5.randomBytes)(32);
   idleTtlMs;
   endTombstones = /* @__PURE__ */ new Map();
   stepTombstones = /* @__PURE__ */ new Map();
@@ -41317,20 +42378,28 @@ var NativeRunManager = class {
         apps: /* @__PURE__ */ new Map(),
         windows: /* @__PURE__ */ new Map(),
         observations: /* @__PURE__ */ new Set(),
-        actions: /* @__PURE__ */ new Map()
+        actions: /* @__PURE__ */ new Map(),
+        visualOverviews: /* @__PURE__ */ new Map()
       };
       const apps = Object.freeze(
-        coreApps.filter((app) => app.running).map((app) => {
+        coreApps.map((app) => {
           const appRef = randomOpaqueId("napp");
           active.apps.set(
             appRef,
-            Object.freeze({ coreAppRef: app.appRef, name: app.name })
+            Object.freeze({
+              coreAppRef: app.appRef,
+              name: app.name,
+              running: app.running,
+              active: app.active,
+              launchable: app.launchable
+            })
           );
           return Object.freeze({
             appRef,
             name: app.name,
             running: app.running,
             active: app.active,
+            launchable: app.launchable,
             untrustedText: true
           });
         })
@@ -41340,11 +42409,71 @@ var NativeRunManager = class {
       return Object.freeze({ runRef, apps });
     });
   }
+  async launchApp(input3) {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input3.runRef);
+      const binding = active.apps.get(input3.appRef);
+      if (!binding) throw new Error("native app reference is stale or invalid");
+      if (!active.core.launchApp)
+        throw new Error("native app launch is unavailable");
+      let result;
+      try {
+        result = await active.core.launchApp({
+          appRef: binding.coreAppRef,
+          operationKey: input3.operationKey
+        });
+      } catch {
+        result = Object.freeze({
+          outcome: "unknown",
+          reasonCode: "reconciliation_required",
+          mutationAttempted: true,
+          reconciliationRequired: true,
+          safeToRetry: false,
+          replayed: false
+        });
+        await active.core.quarantine().catch(() => void 0);
+      }
+      let app;
+      if (result.app) {
+        active.apps.set(
+          input3.appRef,
+          Object.freeze({
+            coreAppRef: result.app.appRef,
+            name: result.app.name,
+            running: result.app.running,
+            active: result.app.active,
+            launchable: result.app.launchable
+          })
+        );
+        app = Object.freeze({
+          appRef: input3.appRef,
+          name: result.app.name,
+          running: result.app.running,
+          active: result.app.active,
+          launchable: result.app.launchable,
+          untrustedText: true
+        });
+      }
+      this.clearWindowCapabilities(active);
+      this.touch(active);
+      return Object.freeze({
+        outcome: result.outcome,
+        reasonCode: result.reasonCode,
+        ...app ? { app } : {},
+        mutationAttempted: result.mutationAttempted,
+        reconciliationRequired: result.reconciliationRequired,
+        safeToRetry: result.safeToRetry,
+        replayed: result.replayed
+      });
+    });
+  }
   async listWindows(input3) {
     return this.mutex.runExclusive(async () => {
       const active = this.requireRun(input3.runRef);
       const app = active.apps.get(input3.appRef);
       if (!app) throw new Error("native app reference is stale or invalid");
+      if (!app.running)
+        throw new Error("native app is stopped and must be launched first");
       let coreWindows;
       try {
         coreWindows = await active.core.listWindows({
@@ -41404,15 +42533,110 @@ var NativeRunManager = class {
       return published;
     });
   }
+  async observeVisual(input3) {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input3.runRef);
+      const window = active.windows.get(input3.windowRef);
+      if (!window)
+        throw new Error("native window reference is stale or invalid");
+      let overview;
+      try {
+        if (!active.core.observeVisual)
+          throw new Error("native visual observation is unavailable");
+        overview = await active.core.observeVisual({
+          windowRef: window.coreWindowRef
+        });
+      } catch {
+        throw new Error("native window screenshot could not be observed");
+      }
+      this.clearObservationCapabilities(active);
+      const visualObservationRef = randomOpaqueId("nvobs");
+      const regionBindings = /* @__PURE__ */ new Map();
+      const regions = Object.freeze(
+        overview.regions.map((region) => {
+          const regionRef = randomOpaqueId("nvreg");
+          regionBindings.set(regionRef, region.id);
+          return Object.freeze({ regionRef, label: region.label });
+        })
+      );
+      active.visualOverviews.set(
+        visualObservationRef,
+        Object.freeze({
+          windowRef: input3.windowRef,
+          coreOverviewId: overview.id,
+          regions: regionBindings
+        })
+      );
+      this.touch(active);
+      return Object.freeze({
+        visualObservationRef,
+        windowRef: input3.windowRef,
+        width: overview.width,
+        height: overview.height,
+        image: overview.image,
+        regions
+      });
+    });
+  }
+  async visualDisclosureContext(input3) {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input3.runRef);
+      const window = active.windows.get(input3.windowRef);
+      const app = window ? active.apps.get(window.publicAppRef) : void 0;
+      if (!window || !app)
+        throw new Error("native window reference is stale or invalid");
+      this.touch(active);
+      return Object.freeze({
+        appLabel: app.name,
+        windowLabel: window.title,
+        untrustedUiData: true
+      });
+    });
+  }
+  async refineVisual(input3) {
+    return this.mutex.runExclusive(async () => {
+      const active = this.requireRun(input3.runRef);
+      const binding = active.visualOverviews.get(input3.visualObservationRef);
+      const coreRegionId = binding?.regions.get(input3.regionRef);
+      if (!binding || !coreRegionId)
+        throw new Error(
+          "native visual observation capability is stale or invalid"
+        );
+      let detail;
+      try {
+        if (!active.core.refineVisual)
+          throw new Error("native visual refinement is unavailable");
+        detail = await active.core.refineVisual({
+          overviewId: binding.coreOverviewId,
+          regionId: coreRegionId
+        });
+      } catch {
+        throw new Error("native visual observation is stale or unavailable");
+      }
+      this.clearObservationCapabilities(active);
+      const observation = this.publishObservation(
+        active,
+        binding.windowRef,
+        detail.observation
+      );
+      this.touch(active);
+      return Object.freeze({
+        observation,
+        width: detail.width,
+        height: detail.height,
+        image: detail.image
+      });
+    });
+  }
   async step(input3) {
     return this.mutex.runExclusive(async () => {
       const tombstoneKey = `${input3.runRef}\0${input3.operationKey}`;
-      const requestDigest = (0, import_node_crypto4.createHash)("sha256").update(
+      const requestDigest = (0, import_node_crypto5.createHash)("sha256").update(
         JSON.stringify({
           observationRef: input3.observationRef,
           actionRef: input3.actionRef,
           verification: input3.verification,
-          textDigest: input3.text === void 0 ? null : (0, import_node_crypto4.createHmac)("sha256", this.approvalIdentityKey).update("jev-cua:native-step-text:v1\0", "utf8").update(input3.text, "utf8").digest("hex")
+          textDigest: input3.text === void 0 ? null : (0, import_node_crypto5.createHmac)("sha256", this.approvalIdentityKey).update("jev-cua:native-step-text:v1\0", "utf8").update(input3.text, "utf8").digest("hex")
         })
       ).digest("hex");
       const completed = this.stepTombstones.get(tombstoneKey);
@@ -41430,21 +42654,23 @@ var NativeRunManager = class {
       if (binding.action.source === "text") {
         if (typeof input3.text !== "string" || input3.text.length === 0 || input3.text.length > 4e3 || containsRecognizableCredential(input3.text)) {
           throw new Error(
-            "native set-value action requires one to 4000 characters of non-sensitive text and rejects recognizable credentials"
+            "native text action requires one to 4000 characters of non-sensitive text and rejects recognizable credentials"
           );
         }
-        action2 = Object.freeze({ kind: "set_value", value: input3.text });
+        action2 = binding.action.kind === "set_value" ? Object.freeze({ kind: "set_value", value: input3.text }) : Object.freeze({ kind: "type_text", text: input3.text });
       } else {
         if (input3.text !== void 0)
-          throw new Error("native text is valid only for a set-value action");
+          throw new Error(
+            "native text is valid only for a returned text-entry action"
+          );
         action2 = binding.action.value;
       }
-      const operationFingerprint = (0, import_node_crypto4.createHmac)(
+      const operationFingerprint = (0, import_node_crypto5.createHmac)(
         "sha256",
         this.approvalIdentityKey
       ).update("jev-cua:native-operation-display:v1\0", "utf8").update(input3.operationKey, "utf8").digest("hex").slice(0, 16);
       const authorizeConsequentialAction = binding.availability === "approval_required" && input3.authorize ? async (request) => {
-        if (request.operationKey !== input3.operationKey || request.actionKind !== action2.kind || request.risk !== binding.risk || request.risk !== "r2_private" && request.risk !== "r3_consequential" || action2.kind !== "click" && action2.kind !== "set_value") {
+        if (request.operationKey !== input3.operationKey || request.actionKind !== action2.kind || request.risk !== binding.risk || request.risk !== "r2_private" && request.risk !== "r3_consequential") {
           return Object.freeze({ status: "failed" });
         }
         return input3.authorize(
@@ -41454,12 +42680,13 @@ var NativeRunManager = class {
             actionRef: input3.actionRef,
             operationFingerprint,
             actionKind: action2.kind,
+            actionDescription: binding.actionDescription,
             risk: request.risk,
             appLabel: binding.appLabel,
             windowLabel: binding.windowLabel,
             controlRole: binding.controlRole,
             ...binding.controlLabel === void 0 ? {} : { controlLabel: binding.controlLabel },
-            ...action2.kind === "set_value" ? { text: action2.value } : {},
+            ...action2.kind === "set_value" ? { text: action2.value } : action2.kind === "type_text" ? { text: action2.text } : {},
             untrustedUiData: true
           })
         );
@@ -41591,6 +42818,7 @@ var NativeRunManager = class {
           coreObservationId: observation.id,
           coreCandidateId: candidate2.id,
           action: Object.freeze(action2),
+          actionDescription: description,
           risk,
           availability,
           appLabel: app.name,
@@ -41611,14 +42839,14 @@ var NativeRunManager = class {
     };
     if (candidate2.actionKinds.includes("click")) {
       const risk = candidate2.riskByAction.click ?? "r4_forbidden";
-      if (candidate2.targetKind === "element" && risk !== "r4_forbidden") {
+      if ((candidate2.targetKind === "element" || candidate2.targetKind === "visual_cell") && risk !== "r4_forbidden") {
         bind(
           Object.freeze({
             source: "fixed",
-            value: Object.freeze({ kind: "click", activation: "press" })
+            value: candidate2.targetKind === "visual_cell" ? Object.freeze({ kind: "click" }) : Object.freeze({ kind: "click", activation: "press" })
           }),
           "click",
-          "Press this control",
+          candidate2.targetKind === "visual_cell" ? `Click visual grid cell ${candidate2.label ?? ""}`.trim() : "Press this control",
           risk,
           risk === "r0_read_only" || risk === "r1_reversible" ? "allowed" : "approval_required"
         );
@@ -41656,14 +42884,87 @@ var NativeRunManager = class {
     }
     if (candidate2.actionKinds.includes("type_text")) {
       const risk = candidate2.riskByAction.type_text ?? "r2_private";
-      actions.push(
-        unavailableAction(
+      if (candidate2.targetKind === "element" && risk !== "r4_forbidden") {
+        bind(
+          Object.freeze({ source: "text", kind: "type_text" }),
           "type_text",
-          "Synthetic text entry is not exposed",
+          "Type non-sensitive text in this control",
           risk,
-          risk === "r4_forbidden" ? "denied" : "not_exposed"
-        )
-      );
+          risk === "r0_read_only" || risk === "r1_reversible" ? "allowed" : "approval_required"
+        );
+      } else {
+        actions.push(
+          unavailableAction(
+            "type_text",
+            "Type non-sensitive text in this control",
+            risk,
+            unavailableForRisk(risk)
+          )
+        );
+      }
+    }
+    if (candidate2.actionKinds.includes("press_key")) {
+      const risk = candidate2.riskByAction.press_key ?? "r4_forbidden";
+      if (risk !== "r4_forbidden") {
+        for (const key of SAFE_KEYS2) {
+          bind(
+            Object.freeze({
+              source: "fixed",
+              value: Object.freeze({ kind: "press_key", key: key.key })
+            }),
+            "press_key",
+            key.description,
+            risk,
+            risk === "r0_read_only" || risk === "r1_reversible" ? "allowed" : "approval_required"
+          );
+        }
+        for (const key of APPROVAL_KEYS) {
+          const keyRisk = risk === "r3_consequential" ? risk : "r2_private";
+          bind(
+            Object.freeze({
+              source: "fixed",
+              value: Object.freeze({ kind: "press_key", key: key.key })
+            }),
+            "press_key",
+            key.description,
+            keyRisk,
+            "approval_required"
+          );
+        }
+      } else {
+        actions.push(
+          unavailableAction(
+            "press_key",
+            "Press a navigation key",
+            risk,
+            "denied"
+          )
+        );
+      }
+    }
+    if (candidate2.actionKinds.includes("invoke_menu")) {
+      const risk = candidate2.riskByAction.invoke_menu ?? "r4_forbidden";
+      if (candidate2.targetKind === "element" && risk !== "r4_forbidden") {
+        bind(
+          Object.freeze({
+            source: "fixed",
+            value: Object.freeze({ kind: "invoke_menu" })
+          }),
+          "invoke_menu",
+          "Choose this exact menu item",
+          risk,
+          risk === "r0_read_only" || risk === "r1_reversible" ? "allowed" : "approval_required"
+        );
+      } else {
+        actions.push(
+          unavailableAction(
+            "invoke_menu",
+            "Choose this exact menu item",
+            risk,
+            unavailableForRisk(risk)
+          )
+        );
+      }
     }
     if (candidate2.targetKind === "window") {
       if (candidate2.actionKinds.includes("scroll")) {
@@ -41719,6 +43020,7 @@ var NativeRunManager = class {
   clearObservationCapabilities(active) {
     active.actions.clear();
     active.observations.clear();
+    active.visualOverviews.clear();
   }
   clearWindowCapabilities(active) {
     this.clearObservationCapabilities(active);
@@ -41801,7 +43103,7 @@ var NativeRunManager = class {
 };
 
 // src/native/operation-store.ts
-var import_node_crypto5 = require("crypto");
+var import_node_crypto6 = require("crypto");
 var import_node_fs2 = require("fs");
 var import_promises3 = require("fs/promises");
 var import_node_path4 = require("path");
@@ -41874,7 +43176,7 @@ async function syncDirectory(path) {
 async function replaceAtomically(directory, path, data) {
   const temporary = (0, import_node_path4.join)(
     directory,
-    `.tmp-${process.pid}-${(0, import_node_crypto5.randomBytes)(8).toString("hex")}`
+    `.tmp-${process.pid}-${(0, import_node_crypto6.randomBytes)(8).toString("hex")}`
   );
   await publishNoReplace(temporary, data);
   try {
@@ -41895,22 +43197,22 @@ function parseRecord(value) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("native operation record is malformed");
   }
-  const record3 = parsed;
+  const record4 = parsed;
   const hasReconciledAt = Object.prototype.hasOwnProperty.call(
-    record3,
+    record4,
     "reconciledAt"
   );
-  if (record3.schema !== "jev-cua.native-operation.v1" || record3.status !== "active" && record3.status !== "complete" || !/^[a-f0-9]{32}$/u.test(String(record3.operationId)) || typeof record3.runId !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/u.test(record3.runId) || hasReconciledAt && (record3.status !== "active" || !isCanonicalTimestamp(
-    record3.reconciledAt
-  )) || !/^[a-f0-9]{64}$/u.test(String(record3.requestFingerprint))) {
+  if (record4.schema !== "jev-cua.native-operation.v1" || record4.status !== "active" && record4.status !== "complete" || !/^[a-f0-9]{32}$/u.test(String(record4.operationId)) || typeof record4.runId !== "string" || !/^[A-Za-z0-9._:-]{1,200}$/u.test(record4.runId) || hasReconciledAt && (record4.status !== "active" || !isCanonicalTimestamp(
+    record4.reconciledAt
+  )) || !/^[a-f0-9]{64}$/u.test(String(record4.requestFingerprint))) {
     throw new Error("native operation record is malformed");
   }
-  if (record3.status === "complete" && !["verified", "refuted", "unknown", "approval_required", "denied"].includes(
-    String(record3.outcome)
+  if (record4.status === "complete" && !["verified", "refuted", "unknown", "approval_required", "denied"].includes(
+    String(record4.outcome)
   )) {
     throw new Error("native operation result is malformed");
   }
-  return record3;
+  return record4;
 }
 var NativeOperationStore = class {
   constructor(stateDirectory) {
@@ -41934,7 +43236,7 @@ var NativeOperationStore = class {
   async loadIdentityKey() {
     await ensurePrivateDirectory(this.stateDirectory);
     try {
-      await publishNoReplace(this.identityKeyPath, (0, import_node_crypto5.randomBytes)(32));
+      await publishNoReplace(this.identityKeyPath, (0, import_node_crypto6.randomBytes)(32));
     } catch (error62) {
       if (!isErrno(error62, "EEXIST")) throw error62;
     }
@@ -41943,7 +43245,7 @@ var NativeOperationStore = class {
     return key;
   }
   async digest(domain2, value) {
-    return (0, import_node_crypto5.createHmac)("sha256", await this.identityKey()).update(`jev-cua:native:v1:${domain2}\0`, "utf8").update(value, "utf8").digest("hex");
+    return (0, import_node_crypto6.createHmac)("sha256", await this.identityKey()).update(`jev-cua:native:v1:${domain2}\0`, "utf8").update(value, "utf8").digest("hex");
   }
   async reserve(operationKey, requestIdentity, runId) {
     if (!operationKey.trim() || operationKey.length > 512)
@@ -41956,8 +43258,8 @@ var NativeOperationStore = class {
       this.digest("request", requestIdentity)
     ]);
     const path = (0, import_node_path4.join)(this.operationsDirectory, `${operationHash}.json`);
-    const operationId = (0, import_node_crypto5.randomBytes)(16).toString("hex");
-    const record3 = Object.freeze({
+    const operationId = (0, import_node_crypto6.randomBytes)(16).toString("hex");
+    const record4 = Object.freeze({
       schema: "jev-cua.native-operation.v1",
       status: "active",
       operationId,
@@ -41965,7 +43267,7 @@ var NativeOperationStore = class {
       requestFingerprint
     });
     try {
-      await publishNoReplace(path, JSON.stringify(record3));
+      await publishNoReplace(path, JSON.stringify(record4));
       return Object.freeze({ status: "reserved", operationId });
     } catch (error62) {
       if (!isErrno(error62, "EEXIST")) throw error62;
@@ -42020,9 +43322,9 @@ var NativeOperationStore = class {
         reasons.push("unsafe_native_operation_record");
         continue;
       }
-      let record3;
+      let record4;
       try {
-        record3 = parseRecord(
+        record4 = parseRecord(
           await readPrivateFile(
             (0, import_node_path4.join)(this.operationsDirectory, entry.name),
             16384
@@ -42033,7 +43335,7 @@ var NativeOperationStore = class {
         reasons.push("unreadable_native_operation_record");
         continue;
       }
-      if (record3.status === "active" && !record3.reconciledAt) {
+      if (record4.status === "active" && !record4.reconciledAt) {
         blockerCount += 1;
         reasons.push("unresolved_native_operation");
       }
@@ -42063,20 +43365,20 @@ var NativeOperationStore = class {
       if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
       if (!entry.isFile() || entry.isSymbolicLink()) continue;
       const path = (0, import_node_path4.join)(this.operationsDirectory, entry.name);
-      let record3;
+      let record4;
       try {
-        record3 = parseRecord(await readPrivateFile(path, 16384));
+        record4 = parseRecord(await readPrivateFile(path, 16384));
       } catch {
         continue;
       }
-      if (record3.status !== "active" || record3.runId !== runId || record3.reconciledAt) {
+      if (record4.status !== "active" || record4.runId !== runId || record4.reconciledAt) {
         continue;
       }
       await replaceAtomically(
         this.operationsDirectory,
         path,
         JSON.stringify({
-          ...record3,
+          ...record4,
           reconciledAt: (/* @__PURE__ */ new Date()).toISOString()
         })
       );
@@ -42107,7 +43409,7 @@ var NativeOperationStore = class {
 };
 
 // src/engine/controller.ts
-var import_node_crypto6 = require("crypto");
+var import_node_crypto7 = require("crypto");
 var import_promises4 = require("timers/promises");
 
 // src/cua/browser.ts
@@ -42791,7 +44093,7 @@ var FastpathController = class {
         "run workflow progress contract does not match the compiled controller policy"
       );
     }
-    const runId = (0, import_node_crypto6.randomUUID)();
+    const runId = (0, import_node_crypto7.randomUUID)();
     const startedAt = (/* @__PURE__ */ new Date()).toISOString();
     const begun = await this.dependencies.runs.begin(
       request.runKey,
@@ -43253,7 +44555,7 @@ var FastpathController = class {
         }
         attemptedActions.add(attemptKey);
         signal?.throwIfAborted();
-        const operationId = (0, import_node_crypto6.randomUUID)();
+        const operationId = (0, import_node_crypto7.randomUUID)();
         await this.dependencies.runs.markPhase(
           runKeyHash,
           runId,
@@ -43530,7 +44832,7 @@ function workflowPolicyFingerprint(manifestDigest, config2, decisionPolicyIdenti
 
 // src/workflows/approval.ts
 var import_node_child_process4 = require("child_process");
-var import_node_crypto7 = require("crypto");
+var import_node_crypto8 = require("crypto");
 var import_node_util4 = require("util");
 var execFileAsync = (0, import_node_util4.promisify)(import_node_child_process4.execFile);
 var approvalBrand = Symbol("jev-cua-approved-workflow");
@@ -43560,7 +44862,7 @@ function digestMatches(expected, stored) {
   if (!/^[a-fA-F0-9]{64}$/u.test(stored)) return false;
   const expectedBytes = Buffer.from(expected, "hex");
   const storedBytes = Buffer.from(stored.toLowerCase(), "hex");
-  return expectedBytes.length === storedBytes.length && (0, import_node_crypto7.timingSafeEqual)(expectedBytes, storedBytes);
+  return expectedBytes.length === storedBytes.length && (0, import_node_crypto8.timingSafeEqual)(expectedBytes, storedBytes);
 }
 async function readWorkflowApproval(workflow, secretReader = readMacOsKeychainSecret) {
   const account = `${workflow.id}@${workflow.version}`;
@@ -43802,7 +45104,7 @@ function createCompiledWorkflowRuntime(input3) {
 }
 
 // src/state.ts
-var import_node_crypto8 = require("crypto");
+var import_node_crypto9 = require("crypto");
 var import_node_fs3 = require("fs");
 var import_promises5 = require("fs/promises");
 var import_node_path5 = require("path");
@@ -43879,7 +45181,7 @@ async function atomicWriteJson(path, directory, value) {
   await ensurePrivateDirectory2(directory);
   const temporary = (0, import_node_path5.join)(
     directory,
-    `.tmp-${process.pid}-${Date.now()}-${(0, import_node_crypto8.randomBytes)(8).toString("hex")}`
+    `.tmp-${process.pid}-${Date.now()}-${(0, import_node_crypto9.randomBytes)(8).toString("hex")}`
   );
   const handle = await (0, import_promises5.open)(temporary, "wx", 384);
   try {
@@ -43900,7 +45202,7 @@ async function publishPrivateFileNoReplace(path, directory, data) {
   await ensurePrivateDirectory2(directory);
   const preparedPath = (0, import_node_path5.join)(
     directory,
-    `.prepared-${process.pid}-${Date.now()}-${(0, import_node_crypto8.randomBytes)(8).toString("hex")}`
+    `.prepared-${process.pid}-${Date.now()}-${(0, import_node_crypto9.randomBytes)(8).toString("hex")}`
   );
   const handle = await (0, import_promises5.open)(preparedPath, "wx", 384);
   try {
@@ -43936,19 +45238,19 @@ var DesktopLease = class {
   async acquire(runId) {
     await ensurePrivateDirectory2(this.stateDirectory);
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const record3 = Object.freeze({
+      const record4 = Object.freeze({
         pid: process.pid,
         runId,
         acquiredAt: (/* @__PURE__ */ new Date()).toISOString()
       });
       const preparedPath = (0, import_node_path5.join)(
         this.stateDirectory,
-        `.desktop-lock-${process.pid}-${Date.now()}-${(0, import_node_crypto8.randomBytes)(8).toString("hex")}`
+        `.desktop-lock-${process.pid}-${Date.now()}-${(0, import_node_crypto9.randomBytes)(8).toString("hex")}`
       );
       try {
         const handle = await (0, import_promises5.open)(preparedPath, "wx", 384);
         try {
-          await handle.writeFile(JSON.stringify(record3), "utf8");
+          await handle.writeFile(JSON.stringify(record4), "utf8");
           await handle.sync();
         } finally {
           await handle.close();
@@ -43963,7 +45265,7 @@ var DesktopLease = class {
               this.lockPath,
               16384
             );
-            if (current.pid === record3.pid && current.runId === record3.runId) {
+            if (current.pid === record4.pid && current.runId === record4.runId) {
               await (0, import_promises5.unlink)(this.lockPath);
             }
             released = true;
@@ -44049,7 +45351,7 @@ var LiveExecutionBarrier = class {
   async markActive(runId, session) {
     await ensurePrivateDirectory2(this.stateDirectory);
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const record3 = Object.freeze({
+    const record4 = Object.freeze({
       schema: "jev-cua.execution-safety-barrier.v1",
       runId,
       session,
@@ -44060,13 +45362,13 @@ var LiveExecutionBarrier = class {
     await publishPrivateFileNoReplace(
       this.path,
       this.stateDirectory,
-      JSON.stringify(record3)
+      JSON.stringify(record4)
     );
   }
   async retain(runId, session, state) {
-    const record3 = await this.readOwnedRecord(runId, session);
+    const record4 = await this.readOwnedRecord(runId, session);
     await atomicWriteJson(this.path, this.stateDirectory, {
-      ...record3,
+      ...record4,
       state,
       updatedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
@@ -44085,7 +45387,7 @@ var LiveExecutionBarrier = class {
     await ensurePrivateDirectory2(archiveDirectory);
     const destination = (0, import_node_path5.join)(
       archiveDirectory,
-      `${(/* @__PURE__ */ new Date()).toISOString().replace(/[^0-9]/gu, "")}-${(0, import_node_crypto8.createHash)("sha256").update(runId, "utf8").digest("hex").slice(0, 16)}-${(0, import_node_crypto8.randomBytes)(4).toString("hex")}.json`
+      `${(/* @__PURE__ */ new Date()).toISOString().replace(/[^0-9]/gu, "")}-${(0, import_node_crypto9.createHash)("sha256").update(runId, "utf8").digest("hex").slice(0, 16)}-${(0, import_node_crypto9.randomBytes)(4).toString("hex")}.json`
     );
     await (0, import_promises5.rename)(this.path, destination);
     await Promise.all([
@@ -44096,20 +45398,20 @@ var LiveExecutionBarrier = class {
   }
   async status() {
     try {
-      const record3 = await readPrivateJson(
+      const record4 = await readPrivateJson(
         this.path,
         16384
       );
-      if (record3.schema !== "jev-cua.execution-safety-barrier.v1" || typeof record3.runId !== "string" || typeof record3.session !== "string" || !isExecutionBarrierState(record3.state) || typeof record3.markedAt !== "string" || typeof record3.updatedAt !== "string") {
+      if (record4.schema !== "jev-cua.execution-safety-barrier.v1" || typeof record4.runId !== "string" || typeof record4.session !== "string" || !isExecutionBarrierState(record4.state) || typeof record4.markedAt !== "string" || typeof record4.updatedAt !== "string") {
         return Object.freeze({ blocked: true });
       }
       return Object.freeze({
         blocked: true,
-        runId: record3.runId,
-        session: record3.session,
-        state: record3.state,
-        markedAt: record3.markedAt,
-        updatedAt: record3.updatedAt
+        runId: record4.runId,
+        session: record4.session,
+        state: record4.state,
+        markedAt: record4.markedAt,
+        updatedAt: record4.updatedAt
       });
     } catch (error62) {
       if (isErrno2(error62, "ENOENT")) return Object.freeze({ blocked: false });
@@ -44117,16 +45419,16 @@ var LiveExecutionBarrier = class {
     }
   }
   async readOwnedRecord(runId, session) {
-    const record3 = await readPrivateJson(
+    const record4 = await readPrivateJson(
       this.path,
       16384
     );
-    if (record3.schema !== "jev-cua.execution-safety-barrier.v1" || record3.runId !== runId || record3.session !== session || !isExecutionBarrierState(record3.state) || typeof record3.markedAt !== "string" || typeof record3.updatedAt !== "string") {
+    if (record4.schema !== "jev-cua.execution-safety-barrier.v1" || record4.runId !== runId || record4.session !== session || !isExecutionBarrierState(record4.state) || typeof record4.markedAt !== "string" || typeof record4.updatedAt !== "string") {
       throw new Error(
         "execution safety barrier is not owned by this browser session"
       );
     }
-    return record3;
+    return record4;
   }
 };
 function isExecutionBarrierState(value) {
@@ -44162,7 +45464,7 @@ var RunStore = class {
       await publishPrivateFileNoReplace(
         this.identityKeyPath,
         stateDirectory,
-        (0, import_node_crypto8.randomBytes)(32)
+        (0, import_node_crypto9.randomBytes)(32)
       );
     } catch (error62) {
       if (!isErrno2(error62, "EEXIST")) throw error62;
@@ -44174,7 +45476,7 @@ var RunStore = class {
   }
   async keyedDigest(domain2, value) {
     const key = await this.identityKey();
-    return (0, import_node_crypto8.createHmac)("sha256", key).update(`jev-cua:v1:${domain2}\0`, "utf8").update(value, "utf8").digest("hex");
+    return (0, import_node_crypto9.createHmac)("sha256", key).update(`jev-cua:v1:${domain2}\0`, "utf8").update(value, "utf8").digest("hex");
   }
   async runKeyHash(runKey) {
     return this.keyedDigest("run-key", runKey);
@@ -44189,7 +45491,7 @@ var RunStore = class {
       this.keyedDigest("request", requestIdentity)
     ]);
     const path = this.pathFor(runKeyHash);
-    const record3 = Object.freeze({
+    const record4 = Object.freeze({
       status: "active",
       runId,
       runKeyHash,
@@ -44202,7 +45504,7 @@ var RunStore = class {
       await publishPrivateFileNoReplace(
         path,
         this.runsDirectory,
-        JSON.stringify(record3)
+        JSON.stringify(record4)
       );
       return { activeElsewhere: false, runKeyHash };
     } catch (error62) {
@@ -44308,9 +45610,9 @@ var RunStore = class {
         malformedRecords += 1;
         continue;
       }
-      const record3 = value;
-      if (record3.status === "active") activeRecords += 1;
-      else if (record3.status === "complete") completeRecords += 1;
+      const record4 = value;
+      if (record4.status === "active") activeRecords += 1;
+      else if (record4.status === "complete") completeRecords += 1;
       else malformedRecords += 1;
     }
     return Object.freeze({
@@ -44339,7 +45641,7 @@ var RunStore = class {
           (0, import_node_path5.join)(this.runsDirectory, entry.name),
           1048576
         );
-        runRecordSha256 = (0, import_node_crypto8.createHash)("sha256").update(data).digest("hex");
+        runRecordSha256 = (0, import_node_crypto9.createHash)("sha256").update(data).digest("hex");
         value = JSON.parse(data.toString("utf8"));
       } catch {
         blockerCount += 1;
@@ -44388,7 +45690,7 @@ var RunStore = class {
         if (storedRunId(value) === runId) {
           matches.push({
             value,
-            sha256: (0, import_node_crypto8.createHash)("sha256").update(data).digest("hex")
+            sha256: (0, import_node_crypto9.createHash)("sha256").update(data).digest("hex")
           });
         }
       } catch {
@@ -44423,7 +45725,7 @@ var RunStore = class {
     return acknowledgement;
   }
   reconciliationPath(runId) {
-    const digest = (0, import_node_crypto8.createHash)("sha256").update(runId, "utf8").digest("hex");
+    const digest = (0, import_node_crypto9.createHash)("sha256").update(runId, "utf8").digest("hex");
     return (0, import_node_path5.join)(this.reconciliationsDirectory, `${digest}.json`);
   }
   async hasReconciliationAcknowledgement(runId, runRecordSha256, reason) {
@@ -44437,14 +45739,14 @@ var RunStore = class {
 };
 function storedRunId(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
-  const record3 = value;
-  if (record3.status === "active") {
-    return isNonemptyString(record3.runId) ? record3.runId : void 0;
+  const record4 = value;
+  if (record4.status === "active") {
+    return isNonemptyString(record4.runId) ? record4.runId : void 0;
   }
-  if (record3.status !== "complete" || !record3.result || typeof record3.result !== "object" || Array.isArray(record3.result)) {
+  if (record4.status !== "complete" || !record4.result || typeof record4.result !== "object" || Array.isArray(record4.result)) {
     return;
   }
-  const runId = record3.result.runId;
+  const runId = record4.result.runId;
   return isNonemptyString(runId) ? runId : void 0;
 }
 function reasonMayBeAcknowledged(reason) {
@@ -44456,8 +45758,8 @@ function reconciliationReasonForRecovery(value, barrierOwnerConfirmed) {
     return reason;
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
-  const record3 = value;
-  if (barrierOwnerConfirmed && (record3.status === "active" && record3.phase === "reserved" || record3.status === "complete" && record3.lastPhase === "reserved")) {
+  const record4 = value;
+  if (barrierOwnerConfirmed && (record4.status === "active" && record4.phase === "reserved" || record4.status === "complete" && record4.lastPhase === "reserved")) {
     return "barrier_owned_reserved";
   }
   return;
@@ -44466,24 +45768,24 @@ function liveExecutionBlockReason(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return "malformed_run_record";
   }
-  const record3 = value;
-  if (record3.status === "active") {
-    if (!isRunPhase(record3.phase) || !isNonemptyString(record3.runId) || !isSha256(record3.runKeyHash) || !isSha256(record3.requestFingerprint) || !isNonemptyString(record3.startedAt) || !Number.isSafeInteger(record3.pid) || Number(record3.pid) <= 0) {
+  const record4 = value;
+  if (record4.status === "active") {
+    if (!isRunPhase(record4.phase) || !isNonemptyString(record4.runId) || !isSha256(record4.runKeyHash) || !isSha256(record4.requestFingerprint) || !isNonemptyString(record4.startedAt) || !Number.isSafeInteger(record4.pid) || Number(record4.pid) <= 0) {
       return "malformed_run_record";
     }
-    return activeRunRequiresReconciliation(record3.phase) ? "interrupted_live_run" : void 0;
+    return activeRunRequiresReconciliation(record4.phase) ? "interrupted_live_run" : void 0;
   }
-  if (record3.status !== "complete" || !isRunPhase(record3.lastPhase) || !isSha256(record3.requestFingerprint)) {
+  if (record4.status !== "complete" || !isRunPhase(record4.lastPhase) || !isSha256(record4.requestFingerprint)) {
     return "malformed_run_record";
   }
-  if (!record3.result || typeof record3.result !== "object" || Array.isArray(record3.result)) {
+  if (!record4.result || typeof record4.result !== "object" || Array.isArray(record4.result)) {
     return "malformed_run_record";
   }
-  const result = record3.result;
+  const result = record4.result;
   if (!isNonemptyString(result.runId) || !isSha256(result.runKeyHash) || !isOutcome(result.outcome) || typeof result.reconciliationRequired !== "boolean" || result.cleanupSucceeded !== null && typeof result.cleanupSucceeded !== "boolean") {
     return "malformed_run_record";
   }
-  if (record3.lastPhase === "reserved") return void 0;
+  if (record4.lastPhase === "reserved") return void 0;
   if (result.cleanupSucceeded === false) return "cleanup_unconfirmed";
   if (result.cleanupSucceeded !== true) {
     return "cleanup_unconfirmed";
@@ -44491,10 +45793,10 @@ function liveExecutionBlockReason(value) {
   if (result.reconciliationRequired === true) {
     return "workflow_reconciliation_required";
   }
-  if (record3.lastPhase === "action_started") {
+  if (record4.lastPhase === "action_started") {
     return "workflow_reconciliation_required";
   }
-  if (record3.lastPhase === "action_returned" && result.outcome !== "verified") {
+  if (record4.lastPhase === "action_returned" && result.outcome !== "verified") {
     return "workflow_reconciliation_required";
   }
   return void 0;
@@ -44626,7 +45928,7 @@ function assertSupportedNodeRuntime(currentVersion = process.versions.node, mini
 
 // src/workflows/manifest.ts
 var import_node_fs4 = require("fs");
-var import_node_crypto9 = require("crypto");
+var import_node_crypto10 = require("crypto");
 var import_promises6 = require("fs/promises");
 var import_node_path6 = require("path");
 
@@ -44889,7 +46191,7 @@ function sameCondition(left, right) {
   return left.kind === "exact_field_equals" && right.kind === "exact_field_equals" && left.input_id === right.input_id && left.page.origin === right.page.origin && left.page.pathname === right.page.pathname && left.field.role === right.field.role && left.field.name === right.field.name;
 }
 function sha256Bytes(value) {
-  return (0, import_node_crypto9.createHash)("sha256").update(value).digest("hex");
+  return (0, import_node_crypto10.createHash)("sha256").update(value).digest("hex");
 }
 function validatedPattern(value) {
   if (!/^\^\[(?:\\.|[^\]\\\r\n])+\](?:[+*?]|\{\d{1,4}(?:,\d{0,4})?\})?\$$/u.test(
@@ -45397,7 +46699,7 @@ var nativeStepSchema = external_exports.object({
   observation_ref: nativeCapabilityRefSchema,
   action_ref: nativeCapabilityRefSchema,
   text: external_exports.string().min(1).max(4e3).describe(
-    "Non-sensitive text for a set_value action only. Never pass passwords, API keys, recovery codes, or other secrets."
+    "Non-sensitive text for a returned set_value or type_text action only. Never pass passwords, API keys, recovery codes, or other secrets."
   ).optional(),
   expect: external_exports.array(nativeVerificationPredicateSchema).min(1).max(8),
   timeout_ms: external_exports.number().int().min(0).max(1e4).default(5e3),
@@ -45408,6 +46710,7 @@ var nativePublicAppSchema = external_exports.object({
   name: external_exports.string().max(200),
   running: external_exports.boolean(),
   active: external_exports.boolean(),
+  launchable: external_exports.boolean(),
   untrusted_text: external_exports.literal(true)
 }).strict();
 var nativePublicWindowSchema = external_exports.object({
@@ -45453,7 +46756,7 @@ var nativePublicObservationSchema = external_exports.object({
   candidates: external_exports.array(
     external_exports.object({
       candidate_ref: nativeCapabilityRefSchema,
-      target_kind: external_exports.enum(["window", "element"]),
+      target_kind: external_exports.enum(["window", "element", "visual_cell"]),
       role: external_exports.string().max(200),
       label: external_exports.string().max(200).optional(),
       value_present: external_exports.boolean(),
@@ -45485,6 +46788,23 @@ var nativeWindowsOutputSchema = external_exports.object({
   ui_text_is_untrusted: external_exports.literal(true).optional(),
   ...nativeFailureFields
 }).strict();
+var nativeLaunchOutputSchema = external_exports.object({
+  outcome: external_exports.enum([
+    "verified",
+    "denied",
+    "unknown",
+    "setup_required",
+    "stale",
+    "busy"
+  ]),
+  reason_code: external_exports.string().min(1).max(80).optional(),
+  app: nativePublicAppSchema.optional(),
+  mutation_attempted: external_exports.boolean().optional(),
+  reconciliation_required: external_exports.boolean().optional(),
+  safe_to_retry: external_exports.boolean().optional(),
+  replayed: external_exports.boolean().optional(),
+  reason: external_exports.string().min(1).max(1e3).optional()
+}).strict();
 var nativeObserveOutputSchema = external_exports.object({
   outcome: external_exports.enum([
     "observed",
@@ -45496,6 +46816,43 @@ var nativeObserveOutputSchema = external_exports.object({
   ]),
   observation: nativePublicObservationSchema.optional(),
   ui_text_is_untrusted: external_exports.literal(true).optional(),
+  ...nativeFailureFields
+}).strict();
+var nativeVisualOverviewSchema = external_exports.object({
+  visual_observation_ref: nativeCapabilityRefSchema,
+  window_ref: nativeCapabilityRefSchema,
+  width: external_exports.number().int().positive().max(8192),
+  height: external_exports.number().int().positive().max(8192),
+  grid: external_exports.object({
+    rows: external_exports.literal(8),
+    columns: external_exports.literal(8),
+    regions: external_exports.array(
+      external_exports.object({
+        region_ref: nativeCapabilityRefSchema,
+        label: external_exports.string().regex(/^[A-H][1-8]$/u)
+      }).strict()
+    ).length(64)
+  }).strict()
+}).strict();
+var nativeVisualObserveOutputSchema = external_exports.object({
+  outcome: external_exports.enum([
+    "observed",
+    "approval_required",
+    "setup_required",
+    "unknown",
+    "stale",
+    "busy"
+  ]),
+  visual_observation: nativeVisualOverviewSchema.optional(),
+  screenshot_in_content: external_exports.literal(true).optional(),
+  ...nativeFailureFields
+}).strict();
+var nativeVisualRefineOutputSchema = external_exports.object({
+  outcome: external_exports.enum(["observed", "setup_required", "unknown", "stale", "busy"]),
+  observation: nativePublicObservationSchema.optional(),
+  width: external_exports.number().int().positive().max(8192).optional(),
+  height: external_exports.number().int().positive().max(8192).optional(),
+  screenshot_in_content: external_exports.literal(true).optional(),
   ...nativeFailureFields
 }).strict();
 var nativeStepOutputSchema = external_exports.object({
@@ -45513,6 +46870,7 @@ var nativeStepOutputSchema = external_exports.object({
     "verified",
     "verification_unsatisfied",
     "verification_unknown",
+    "verification_mismatch",
     "precondition_already_satisfied",
     "precondition_unknown",
     "approval_required",
@@ -45595,12 +46953,23 @@ function toolResult(value) {
     structuredContent: value
   };
 }
+function toolResultWithImage(value, image) {
+  const text = JSON.stringify(value);
+  return {
+    content: [
+      { type: "text", text },
+      { type: "image", data: image.data, mimeType: image.mimeType }
+    ],
+    structuredContent: value
+  };
+}
 function publicNativeApp(app) {
   return {
     app_ref: app.appRef,
     name: app.name,
     running: app.running,
     active: app.active,
+    launchable: app.launchable,
     untrusted_text: app.untrustedText
   };
 }
@@ -45737,6 +47106,19 @@ var server = new McpServer(
   { name: "jev-cua", version: VERSION2 },
   { capabilities: { logging: {} } }
 );
+var visualDisclosureDecisions = /* @__PURE__ */ new Map();
+function visualDisclosureKey(runRef, windowRef) {
+  return `${runRef}\0${windowRef}`;
+}
+function clearVisualDisclosureDecisions(runRef) {
+  if (runRef === void 0) {
+    visualDisclosureDecisions.clear();
+    return;
+  }
+  for (const key of visualDisclosureDecisions.keys()) {
+    if (key.startsWith(`${runRef}\0`)) visualDisclosureDecisions.delete(key);
+  }
+}
 server.registerTool(
   "jev_cua_doctor",
   {
@@ -45812,7 +47194,7 @@ server.registerTool(
   "jev_cua_native_start",
   {
     title: "Start guarded Mac computer use",
-    description: "Start one guarded native Mac run and return opaque references for currently running Accessibility-visible apps. This v1 surface does not launch apps, capture screenshots, or expose Cua arguments.",
+    description: "Start one guarded general Mac computer-use run and return opaque references for installed apps. Running apps can be inspected immediately; stopped apps can be launched through their exact opaque capability.",
     outputSchema: nativeStartOutputSchema,
     annotations: {
       readOnlyHint: false,
@@ -45865,14 +47247,55 @@ server.registerTool(
     }
     try {
       const started = await current.nativeManager.start();
+      clearVisualDisclosureDecisions();
       return toolResult({
         outcome: "ready",
         ...publicNativeStart(started),
         ui_text_is_untrusted: true,
-        scope: "Currently running Accessibility-visible Mac apps. Reversible clicks and bounded scrolling may run automatically; other bound AXPress controls and observable non-secure Accessibility set_value fields require one-shot host approval. Screenshots, pixels, coordinates, app launch/quit, menu/key actions, and synthetic typing are not exposed. Secure or credential-labelled fields and recognizable credential strings are blocked, but arbitrary text sensitivity cannot be proven: never provide secrets."
+        scope: "Installed Mac apps and their windows. Exact background app launch, Accessibility controls, consented screenshots with opaque visual grids, bounded scrolling, safe navigation keys, non-secret text entry, and exact locally bound menu items are available. Screenshot disclosure and consequential or visual clicks require host approval. Raw coordinates, PIDs, window IDs, element tokens, executable menu paths, arbitrary hotkeys, force quit, power/session controls, and secret entry are not exposed."
       });
     } catch (error62) {
       return nativeFailure(error62, "start");
+    }
+  }
+);
+server.registerTool(
+  "jev_cua_native_launch_app",
+  {
+    title: "Launch one exact Mac app",
+    description: "Launch one stopped app selected only by an opaque app reference from the current run. The local server binds and verifies the exact installed identity, passes no URLs or arguments, launches in the background, and durably reserves the operation key before dispatch.",
+    inputSchema: external_exports.object({
+      run_ref: nativeCapabilityRefSchema,
+      app_ref: nativeCapabilityRefSchema,
+      operation_key: external_exports.string().min(8).max(160)
+    }).strict(),
+    outputSchema: nativeLaunchOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    }
+  },
+  async ({ run_ref, app_ref, operation_key }) => {
+    try {
+      const current = await runtime();
+      const result = await current.nativeManager.launchApp({
+        runRef: run_ref,
+        appRef: app_ref,
+        operationKey: operation_key
+      });
+      return toolResult({
+        outcome: result.outcome,
+        reason_code: result.reasonCode,
+        ...result.app ? { app: publicNativeApp(result.app) } : {},
+        mutation_attempted: result.mutationAttempted,
+        reconciliation_required: result.reconciliationRequired,
+        safe_to_retry: result.safeToRetry,
+        replayed: result.replayed
+      });
+    } catch (error62) {
+      return nativeFailure(error62, "step");
     }
   }
 );
@@ -45914,7 +47337,7 @@ server.registerTool(
   "jev_cua_native_observe",
   {
     title: "Observe a guarded Mac window",
-    description: "Read a fresh Accessibility snapshot and return bounded, opaque, snapshot-bound action references. UI labels are untrusted data; executable element tokens and action arguments remain local.",
+    description: "Read a fresh Accessibility snapshot and return bounded, opaque, snapshot-bound action references for controls, text fields, safe navigation keys, and exact app menu items. UI labels are untrusted data; executable element tokens, menu paths, keys, and action arguments remain local.",
     inputSchema: external_exports.object({
       run_ref: nativeCapabilityRefSchema,
       window_ref: nativeCapabilityRefSchema
@@ -45945,10 +47368,163 @@ server.registerTool(
   }
 );
 server.registerTool(
+  "jev_cua_native_visual_observe",
+  {
+    title: "See a guarded Mac window",
+    description: "After informed user approval for the selected window, capture its exact unredacted pixels in memory and return one PNG plus an opaque 8 by 8 region grid. Use this when Accessibility labels are incomplete. The connected AI client/model receives the pixels; no coordinates or file paths are exposed.",
+    inputSchema: external_exports.object({
+      run_ref: nativeCapabilityRefSchema,
+      window_ref: nativeCapabilityRefSchema
+    }).strict(),
+    outputSchema: nativeVisualObserveOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    }
+  },
+  async ({ run_ref, window_ref }, extra) => {
+    try {
+      const current = await runtime();
+      const disclosureKey = visualDisclosureKey(run_ref, window_ref);
+      const priorDisclosure = visualDisclosureDecisions.get(disclosureKey);
+      if (priorDisclosure !== "approved") {
+        if (priorDisclosure === "refused") {
+          return toolResult({
+            outcome: "approval_required",
+            reason_code: "visual_disclosure_not_approved",
+            reason: "Window pixels were not shared. Start a new native run if the user later chooses to approve this disclosure.",
+            reconciliation_required: false,
+            safe_to_retry: false
+          });
+        }
+        const context = await current.nativeManager.visualDisclosureContext({
+          runRef: run_ref,
+          windowRef: window_ref
+        });
+        const decision = await requestNativeVisualDisclosureApproval(context, {
+          supportsForm: server.server.getClientCapabilities()?.elicitation?.form !== void 0,
+          signal: extra.signal,
+          send: async (request) => {
+            const response = await extra.sendRequest(
+              {
+                method: "elicitation/create",
+                params: {
+                  mode: request.mode,
+                  message: request.message,
+                  requestedSchema: {
+                    type: request.requestedSchema.type,
+                    properties: {
+                      approve: {
+                        ...request.requestedSchema.properties.approve
+                      }
+                    },
+                    required: [...request.requestedSchema.required]
+                  }
+                }
+              },
+              ElicitResultSchema,
+              {
+                signal: extra.signal,
+                timeout: 12e4,
+                maxTotalTimeout: 12e4
+              }
+            );
+            return Object.freeze({
+              action: response.action,
+              ...response.content === void 0 ? {} : { content: response.content }
+            });
+          }
+        });
+        if (decision.status !== "approved") {
+          visualDisclosureDecisions.set(disclosureKey, "refused");
+          return toolResult({
+            outcome: "approval_required",
+            reason_code: `visual_disclosure_${decision.status}`,
+            reason: "Window pixels were not shared because screenshot disclosure was not approved.",
+            reconciliation_required: false,
+            safe_to_retry: false
+          });
+        }
+        visualDisclosureDecisions.set(disclosureKey, "approved");
+      }
+      const visual = await current.nativeManager.observeVisual({
+        runRef: run_ref,
+        windowRef: window_ref
+      });
+      return toolResultWithImage(
+        {
+          outcome: "observed",
+          visual_observation: {
+            visual_observation_ref: visual.visualObservationRef,
+            window_ref: visual.windowRef,
+            width: visual.width,
+            height: visual.height,
+            grid: {
+              rows: 8,
+              columns: 8,
+              regions: visual.regions.map((region) => ({
+                region_ref: region.regionRef,
+                label: region.label
+              }))
+            }
+          },
+          screenshot_in_content: true
+        },
+        visual.image
+      );
+    } catch (error62) {
+      return nativeFailure(error62, "read");
+    }
+  }
+);
+server.registerTool(
+  "jev_cua_native_visual_refine",
+  {
+    title: "Refine one guarded Mac window region",
+    description: "Zoom one opaque region from the latest exact screenshot and return a JPEG plus 64 opaque click candidates. Every visual click requires one-shot approval and is rebound against unchanged full-window and zoom pixels before dispatch.",
+    inputSchema: external_exports.object({
+      run_ref: nativeCapabilityRefSchema,
+      visual_observation_ref: nativeCapabilityRefSchema,
+      region_ref: nativeCapabilityRefSchema
+    }).strict(),
+    outputSchema: nativeVisualRefineOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    }
+  },
+  async ({ run_ref, visual_observation_ref, region_ref }) => {
+    try {
+      const current = await runtime();
+      const detail = await current.nativeManager.refineVisual({
+        runRef: run_ref,
+        visualObservationRef: visual_observation_ref,
+        regionRef: region_ref
+      });
+      return toolResultWithImage(
+        {
+          outcome: "observed",
+          observation: publicNativeObservation(detail.observation),
+          width: detail.width,
+          height: detail.height,
+          screenshot_in_content: true
+        },
+        detail.image
+      );
+    } catch (error62) {
+      return nativeFailure(error62, "read");
+    }
+  }
+);
+server.registerTool(
   "jev_cua_native_step",
   {
     title: "Execute one verified native Mac action",
-    description: "Execute exactly one previously returned opaque action, after deterministic precondition checks and a fresh semantic rebind, then require the supplied postcondition. Approval-required clicks and non-sensitive set_value actions use a one-shot host consent form when supported. The caller cannot choose Cua tools, keys, coordinates, or element tokens. Never put secrets in text or use a new operation key to retry an uncertain mutation.",
+    description: "Execute exactly one previously returned opaque action after a fresh rebind, then require the supplied semantic Accessibility postcondition. Screenshot-targeted clicks still require an exact semantic postcondition; pixel change alone is never proof of the intended effect. type_text requires exact value_equals readback on the bound control. Approval-required clicks, text entry, and menu actions use a one-shot host consent form when supported. The caller cannot choose Cua tools, keys, executable menu paths, coordinates, or element tokens. Never put secrets in text or use a new operation key to retry an uncertain mutation.",
     inputSchema: nativeStepSchema,
     outputSchema: nativeStepOutputSchema,
     annotations: {
@@ -46027,6 +47603,7 @@ server.registerTool(
     try {
       const current = await runtime();
       const result = await current.nativeManager.end({ runRef: run_ref });
+      clearVisualDisclosureDecisions(run_ref);
       return toolResult(
         result.cleanupSucceeded && !result.reconciliationRequired ? { outcome: "ended", ...publicNativeEnd(result) } : {
           outcome: "unknown",

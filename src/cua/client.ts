@@ -12,13 +12,94 @@ import { Ajv } from "ajv";
 import formatsPlugin from "ajv-formats";
 
 import type {
+  DriverCallResult,
   DriverClient,
+  DriverImageContent,
   DriverToolDescriptor,
   JsonValue,
 } from "../types.js";
 import { asRecord } from "../util.js";
 
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+const MAX_IMAGE_BLOCKS = 4;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024;
+
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+
+function decodeCanonicalBase64(data: string): Buffer {
+  if (
+    data.length === 0 ||
+    data.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
+      data,
+    )
+  ) {
+    throw new TypeError("Cua returned malformed image data");
+  }
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const byteLength = (data.length / 4) * 3 - padding;
+  if (byteLength > MAX_IMAGE_BYTES) {
+    throw new TypeError("Cua returned an oversized image block");
+  }
+  const decoded = Buffer.from(data, "base64");
+  if (
+    decoded.byteLength !== byteLength ||
+    decoded.toString("base64") !== data
+  ) {
+    throw new TypeError("Cua returned malformed image data");
+  }
+  return decoded;
+}
+
+export function validateDriverImageContent(
+  content: readonly unknown[],
+): readonly DriverImageContent[] {
+  const imageItems = content.filter(
+    (item): item is Record<string, unknown> =>
+      typeof item === "object" &&
+      item !== null &&
+      (item as { type?: unknown }).type === "image",
+  );
+  if (imageItems.length > MAX_IMAGE_BLOCKS) {
+    throw new TypeError("Cua returned too many image blocks");
+  }
+
+  let totalBytes = 0;
+  return imageItems.map((item) => {
+    if (
+      (item.mimeType !== "image/png" && item.mimeType !== "image/jpeg") ||
+      typeof item.data !== "string"
+    ) {
+      throw new TypeError("Cua returned an unsupported image block");
+    }
+    const decoded = decodeCanonicalBase64(item.data);
+    totalBytes += decoded.byteLength;
+    if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
+      throw new TypeError("Cua returned too much image data");
+    }
+    const signatureMatches =
+      item.mimeType === "image/png"
+        ? decoded.subarray(0, PNG_SIGNATURE.byteLength).equals(PNG_SIGNATURE)
+        : decoded.byteLength >= 4 &&
+          decoded[0] === 0xff &&
+          decoded[1] === 0xd8 &&
+          decoded.at(-2) === 0xff &&
+          decoded.at(-1) === 0xd9;
+    if (!signatureMatches) {
+      throw new TypeError(
+        "Cua returned image data that did not match its MIME type",
+      );
+    }
+    return {
+      type: "image" as const,
+      data: item.data,
+      mimeType: item.mimeType,
+    };
+  });
+}
 
 function createCuaSchemaValidator(): AjvJsonSchemaValidator {
   const ajv = new Ajv({
@@ -220,6 +301,24 @@ export class CuaMcpClient implements DriverClient {
     arguments_: Record<string, JsonValue>,
     options: Readonly<{ signal?: AbortSignal }> = {},
   ): Promise<Record<string, unknown>> {
+    const result = await this.callInternal(tool, arguments_, options, false);
+    return result.structuredContent;
+  }
+
+  async callWithContent(
+    tool: string,
+    arguments_: Record<string, JsonValue>,
+    options: Readonly<{ signal?: AbortSignal }> = {},
+  ): Promise<DriverCallResult> {
+    return this.callInternal(tool, arguments_, options, true);
+  }
+
+  private async callInternal(
+    tool: string,
+    arguments_: Record<string, JsonValue>,
+    options: Readonly<{ signal?: AbortSignal }>,
+    includeImages: boolean,
+  ): Promise<DriverCallResult> {
     await this.connect();
     try {
       const result = await this.client!.callTool(
@@ -274,7 +373,12 @@ export class CuaMcpClient implements DriverClient {
             knownErrorCode(result.content),
           );
         validateStructuredReceipt(tool, arguments_, data);
-        return data;
+        return {
+          structuredContent: data,
+          images: includeImages
+            ? validateDriverImageContent(result.content)
+            : [],
+        };
       }
       if (result.isError)
         throw new DriverToolError(
@@ -524,6 +628,20 @@ export function validateStructuredReceipt(
           `${tool} receipt did not preserve background delivery`,
         );
       }
+    }
+    return;
+  }
+  if (tool === "launch_app") {
+    if (
+      !data.launch_state ||
+      typeof data.launch_state !== "object" ||
+      Array.isArray(data.launch_state)
+    ) {
+      throw new DriverToolError(
+        tool,
+        true,
+        `${tool} returned no structural launch receipt`,
+      );
     }
     return;
   }

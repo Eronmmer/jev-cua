@@ -145,3 +145,34 @@ test("native receipt validation rejects silent foreground fallback", () => {
       error instanceof DriverToolError && error.ambiguousExecution,
   );
 });
+
+test("launch_app accepts the Cua 0.28.2 structural receipt without status", () => {
+  assert.doesNotThrow(() =>
+    validateStructuredReceipt(
+      "launch_app",
+      { bundle_id: "com.apple.calculator" },
+      {
+        bundle_id: "com.apple.calculator",
+        name: "Calculator",
+        pid: 57332,
+        launch_state: {
+          requested: true,
+          process_running: true,
+          window_ready: true,
+        },
+        self_activation_suppressed: true,
+        windows: [],
+      },
+    ),
+  );
+  assert.throws(
+    () =>
+      validateStructuredReceipt(
+        "launch_app",
+        { bundle_id: "com.apple.calculator" },
+        {},
+      ),
+    (error: unknown) =>
+      error instanceof DriverToolError && error.ambiguousExecution,
+  );
+});

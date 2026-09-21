@@ -240,7 +240,7 @@ describe("compiled workflow manifests", () => {
     assert.equal(
       candidates.find((candidate) => candidate.action?.tool === "browser_click")
         ?.risk,
-      "r4_forbidden",
+      "r3_consequential",
     );
   });
 

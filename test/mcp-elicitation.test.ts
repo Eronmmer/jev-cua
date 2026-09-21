@@ -23,6 +23,7 @@ test("SDK form elicitation carries one exact native approval through the pending
     actionRef: "nact_public",
     operationFingerprint: "0123456789abcdef",
     actionKind: "click",
+    actionDescription: "Press this control",
     risk: "r3_consequential",
     appLabel: "Fixture App",
     windowLabel: "Fixture Window",

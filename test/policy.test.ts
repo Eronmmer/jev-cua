@@ -326,7 +326,7 @@ describe("browser candidate construction", () => {
 });
 
 describe("risk classification", () => {
-  test("classifies credential entry and forbidden irreversible actions as forbidden", () => {
+  test("classifies credential entry and host power/session actions as forbidden", () => {
     assert.equal(
       classifyRisk({
         label: "Username",
@@ -336,10 +336,7 @@ describe("risk classification", () => {
       "r4_forbidden",
     );
     for (const label of [
-      "Delete account",
-      "Purchase now",
       "Enter password",
-      "Accept legal agreement",
       "Force Quit Calculator",
       "Restart",
       "Shut Down",
@@ -361,6 +358,9 @@ describe("risk classification", () => {
       "Upload file",
       "Deploy release",
       "Share report",
+      "Delete account",
+      "Purchase now",
+      "Accept legal agreement",
     ]) {
       assert.equal(
         classifyRisk({ label, actionKind: "click" }),

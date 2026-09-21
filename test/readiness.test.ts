@@ -28,6 +28,7 @@ const requiredTools = [
   "get_window_state",
   "verify_state",
   "launch_app",
+  "zoom",
   "start_session",
   "click",
   "type_text",

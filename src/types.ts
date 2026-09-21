@@ -173,6 +173,17 @@ export type DriverToolDescriptor = Readonly<{
   outputSchema?: Record<string, unknown>;
 }>;
 
+export type DriverImageContent = Readonly<{
+  type: "image";
+  data: string;
+  mimeType: "image/png" | "image/jpeg";
+}>;
+
+export type DriverCallResult = Readonly<{
+  structuredContent: Record<string, unknown>;
+  images: readonly DriverImageContent[];
+}>;
+
 export interface DriverClient {
   connect(): Promise<void>;
   listTools(): Promise<readonly DriverToolDescriptor[]>;
@@ -181,6 +192,11 @@ export interface DriverClient {
     arguments_: Record<string, JsonValue>,
     options?: Readonly<{ signal?: AbortSignal }>,
   ): Promise<Record<string, unknown>>;
+  callWithContent?(
+    tool: string,
+    arguments_: Record<string, JsonValue>,
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ): Promise<DriverCallResult>;
   close(): Promise<void>;
 }
 

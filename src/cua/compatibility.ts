@@ -24,6 +24,7 @@ const REQUIRED_TOOLS = Object.freeze([
   "get_window_state",
   "verify_state",
   "launch_app",
+  "zoom",
   "start_session",
   "end_session",
   "click",

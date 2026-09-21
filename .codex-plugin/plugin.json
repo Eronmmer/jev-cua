@@ -1,7 +1,7 @@
 {
   "name": "jev-cua",
-  "version": "0.1.0+codex.20260921004427",
-  "description": "Guarded Mac Accessibility control with deterministic fast paths and optional TypeSafe Jev routing.",
+  "version": "0.1.0+codex.20260921012028",
+  "description": "Guarded general Mac computer use with consented screenshots, opaque visual targeting, verified actions, and deterministic fast paths.",
   "author": {
     "name": "Eronmonsele Aigbiluese",
     "url": "https://github.com/Eronmmer"
@@ -11,15 +11,17 @@
   "keywords": ["computer-use", "cua", "jev", "typesafe", "mcp"],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Jev Cua Accessibility",
-    "shortDescription": "Guarded Mac Accessibility with verified fast paths.",
-    "longDescription": "Provides app-agnostic guarded Accessibility control for already-running Mac apps; it is not full computer use. Native v1 exposes AXPress, bounded vertical scroll, and approval-gated Accessibility set-value, while excluding screenshots, coordinates, synthetic typing, key/menu invocation, and app launch/quit. Secret detection is best-effort, so callers must never supply secrets and should assume tool arguments and approval forms may be logged. Reviewed repetitive browser workflows add digest pinning and deterministic execution. Optional Jev routing recommends among installed workflows without executing them.",
+    "displayName": "Jev Cua Computer Use",
+    "shortDescription": "Guarded general Mac control with verified actions.",
+    "longDescription": "Provides app-agnostic Mac computer use through exact app launch, Accessibility controls, consented in-memory screenshots, opaque two-stage visual targeting when the result remains semantically verifiable, non-secret text entry, keys, menus, and scrolling. Raw coordinates, PIDs, native refs, executable menu paths, arbitrary hotkeys, force quit, power/session actions, and secret entry stay unavailable. Every mutation is rebound against fresh state, durably at-most-once, and must satisfy an explicit postcondition; consequential actions use one-shot approval. Reviewed repetitive browser workflows add deterministic fast paths, while optional TypeSafe Jev routing only recommends among installed workflows.",
     "developerName": "Eronmonsele Aigbiluese",
     "category": "Productivity",
     "capabilities": ["Computer Use", "Interactive", "Write"],
     "websiteURL": "https://github.com/Eronmmer/jev-cua",
     "defaultPrompt": [
-      "Use Jev Cua to operate this already-running Mac app safely.",
+      "Use Jev Cua to operate this Mac app and verify each change.",
+      "Launch this app and complete the task through general Mac computer use.",
+      "Use visual targeting for a control Accessibility cannot identify when its intended result is still semantically verifiable.",
       "Inspect this app and show me its available bound actions and approval requirements.",
       "Run this reviewed browser workflow through the compiled fast path.",
       "Recommend the installed workflow that matches this request.",
